@@ -1,3 +1,9 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import * as readline from "node:readline";
+import { Readable, Writable } from "node:stream";
+import { fileURLToPath } from "node:url";
 import {
   ClientSideConnection,
   PROTOCOL_VERSION,
@@ -6,86 +12,44 @@ import {
   type RequestPermissionResponse,
   type SessionNotification,
 } from "@agentclientprotocol/sdk";
-import { spawn, type ChildProcess } from "node:child_process";
-import * as readline from "node:readline";
-import { Readable, Writable } from "node:stream";
 import { ensureOpenClawCliOnPath } from "../infra/path-env.js";
-
-/**
- * Tools that require explicit user approval in ACP sessions.
- * These tools can execute arbitrary code, modify the filesystem,
- * or access sensitive resources.
- */
-const DANGEROUS_ACP_TOOLS = new Set([
-  "exec",
-  "spawn",
-  "shell",
-  "sessions_spawn",
-  "sessions_send",
-  "gateway",
-  "fs_write",
-  "fs_delete",
-  "fs_move",
-  "apply_patch",
-]);
+import {
+  materializeWindowsSpawnProgram,
+  resolveWindowsSpawnProgram,
+} from "../plugin-sdk/windows-spawn.js";
+import {
+  listKnownProviderAuthEnvVarNames,
+  omitEnvKeysCaseInsensitive,
+} from "../secrets/provider-env-vars.js";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "../shared/string-coerce.js";
+import { sanitizeTerminalText } from "../terminal/safe-text.js";
+import { classifyAcpToolApproval, type AcpApprovalClass } from "./approval-classifier.js";
 
 type PermissionOption = RequestPermissionRequest["options"][number];
 
 type PermissionResolverDeps = {
   prompt?: (toolName: string | undefined, toolTitle?: string) => Promise<boolean>;
   log?: (line: string) => void;
+  cwd?: string;
 };
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function readFirstStringValue(
-  source: Record<string, unknown> | undefined,
-  keys: string[],
+function resolveToolKindForPermission(
+  toolName: string | undefined,
+  approvalClass: AcpApprovalClass,
 ): string | undefined {
-  if (!source) {
+  if (!toolName && approvalClass === "unknown") {
     return undefined;
   }
-  for (const key of keys) {
-    const value = source[key];
-    if (typeof value === "string" && value.trim()) {
-      return value.trim();
-    }
+  if (approvalClass === "readonly_scoped") {
+    return "readonly_scoped";
   }
-  return undefined;
-}
-
-function normalizeToolName(value: string): string | undefined {
-  const normalized = value.trim().toLowerCase();
-  if (!normalized) {
-    return undefined;
+  if (approvalClass === "readonly_search") {
+    return "readonly_search";
   }
-  return normalized;
-}
-
-function parseToolNameFromTitle(title: string | undefined | null): string | undefined {
-  if (!title) {
-    return undefined;
-  }
-  const head = title.split(":", 1)[0]?.trim();
-  if (!head || !/^[a-zA-Z0-9._-]+$/.test(head)) {
-    return undefined;
-  }
-  return normalizeToolName(head);
-}
-
-function resolveToolNameForPermission(params: RequestPermissionRequest): string | undefined {
-  const toolCall = params.toolCall;
-  const toolMeta = asRecord(toolCall?._meta);
-  const rawInput = asRecord(toolCall?.rawInput);
-
-  const fromMeta = readFirstStringValue(toolMeta, ["toolName", "tool_name", "name"]);
-  const fromRawInput = readFirstStringValue(rawInput, ["tool", "toolName", "tool_name", "name"]);
-  const fromTitle = parseToolNameFromTitle(toolCall?.title);
-  return normalizeToolName(fromMeta ?? fromRawInput ?? fromTitle ?? "");
+  return approvalClass;
 }
 
 function pickOption(
@@ -142,7 +106,7 @@ function promptUserPermission(toolName: string | undefined, toolTitle?: string):
         : toolTitle
       : (toolName ?? "unknown tool");
     rl.question(`\n[permission] Allow "${label}"? (y/N) `, (answer) => {
-      const approved = answer.trim().toLowerCase() === "y";
+      const approved = normalizeLowercaseStringOrEmpty(answer) === "y";
       console.error(`[permission ${approved ? "approved" : "denied"}] ${toolName ?? "unknown"}`);
       finish(approved);
     });
@@ -155,9 +119,12 @@ export async function resolvePermissionRequest(
 ): Promise<RequestPermissionResponse> {
   const log = deps.log ?? ((line: string) => console.error(line));
   const prompt = deps.prompt ?? promptUserPermission;
+  const cwd = deps.cwd ?? process.cwd();
   const options = params.options ?? [];
-  const toolTitle = params.toolCall?.title ?? "tool";
-  const toolName = resolveToolNameForPermission(params);
+  const toolTitle = sanitizeTerminalText(params.toolCall?.title ?? "tool");
+  const classification = classifyAcpToolApproval({ toolCall: params.toolCall, cwd });
+  const toolName = classification.toolName;
+  const toolKind = resolveToolKindForPermission(toolName, classification.approvalClass);
 
   if (options.length === 0) {
     log(`[permission cancelled] ${toolName ?? "unknown"}: no options available`);
@@ -166,7 +133,7 @@ export async function resolvePermissionRequest(
 
   const allowOption = pickOption(options, ["allow_once", "allow_always"]);
   const rejectOption = pickOption(options, ["reject_once", "reject_always"]);
-  const promptRequired = !toolName || DANGEROUS_ACP_TOOLS.has(toolName);
+  const promptRequired = !classification.autoApprove;
 
   if (!promptRequired) {
     const option = allowOption ?? options[0];
@@ -174,11 +141,13 @@ export async function resolvePermissionRequest(
       log(`[permission cancelled] ${toolName}: no selectable options`);
       return cancelledPermission();
     }
-    log(`[permission auto-approved] ${toolName}`);
+    log(`[permission auto-approved] ${toolName} (${toolKind ?? "unknown"})`);
     return selectedPermission(option.optionId);
   }
 
-  log(`\n[permission requested] ${toolTitle}${toolName ? ` (${toolName})` : ""}`);
+  log(
+    `\n[permission requested] ${toolTitle}${toolName ? ` (${toolName})` : ""}${toolKind ? ` [${toolKind}]` : ""}`,
+  );
   const approved = await prompt(toolName, toolTitle);
 
   if (approved && allowOption) {
@@ -223,6 +192,107 @@ function buildServerArgs(opts: AcpClientOptions): string[] {
   return args;
 }
 
+type AcpClientSpawnEnvOptions = {
+  stripKeys?: Iterable<string>;
+};
+
+export function resolveAcpClientSpawnEnv(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+  options: AcpClientSpawnEnvOptions = {},
+): NodeJS.ProcessEnv {
+  const env = omitEnvKeysCaseInsensitive(baseEnv, options.stripKeys ?? []);
+  env.OPENCLAW_SHELL = "acp-client";
+  return env;
+}
+
+export function shouldStripProviderAuthEnvVarsForAcpServer(
+  params: {
+    serverCommand?: string;
+    serverArgs?: string[];
+    defaultServerCommand?: string;
+    defaultServerArgs?: string[];
+  } = {},
+): boolean {
+  const serverCommand = normalizeOptionalString(params.serverCommand);
+  if (!serverCommand) {
+    return true;
+  }
+  const defaultServerCommand = normalizeOptionalString(params.defaultServerCommand);
+  if (!defaultServerCommand || serverCommand !== defaultServerCommand) {
+    return false;
+  }
+  const serverArgs = params.serverArgs ?? [];
+  const defaultServerArgs = params.defaultServerArgs ?? [];
+  return (
+    serverArgs.length === defaultServerArgs.length &&
+    serverArgs.every((arg, index) => arg === defaultServerArgs[index])
+  );
+}
+
+export function buildAcpClientStripKeys(params: {
+  stripProviderAuthEnvVars?: boolean;
+  activeSkillEnvKeys?: Iterable<string>;
+}): Set<string> {
+  const stripKeys = new Set<string>(params.activeSkillEnvKeys ?? []);
+  if (params.stripProviderAuthEnvVars) {
+    for (const key of listKnownProviderAuthEnvVarNames()) {
+      stripKeys.add(key);
+    }
+  }
+  return stripKeys;
+}
+
+type AcpSpawnRuntime = {
+  platform: NodeJS.Platform;
+  env: NodeJS.ProcessEnv;
+  execPath: string;
+};
+
+const DEFAULT_ACP_SPAWN_RUNTIME: AcpSpawnRuntime = {
+  platform: process.platform,
+  env: process.env,
+  execPath: process.execPath,
+};
+
+export function resolveAcpClientSpawnInvocation(
+  params: { serverCommand: string; serverArgs: string[] },
+  runtime: AcpSpawnRuntime = DEFAULT_ACP_SPAWN_RUNTIME,
+): { command: string; args: string[]; shell?: boolean; windowsHide?: boolean } {
+  const program = resolveWindowsSpawnProgram({
+    command: params.serverCommand,
+    platform: runtime.platform,
+    env: runtime.env,
+    execPath: runtime.execPath,
+    packageName: "openclaw",
+  });
+  const resolved = materializeWindowsSpawnProgram(program, params.serverArgs);
+  return {
+    command: resolved.command,
+    args: resolved.argv,
+    shell: resolved.shell,
+    windowsHide: resolved.windowsHide,
+  };
+}
+
+function resolveSelfEntryPath(): string | null {
+  // Prefer a path relative to the built module location (dist/acp/client.js -> dist/entry.js).
+  try {
+    const here = fileURLToPath(import.meta.url);
+    const candidate = path.resolve(path.dirname(here), "..", "entry.js");
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  } catch {
+    // ignore
+  }
+
+  const argv1 = normalizeOptionalString(process.argv[1]);
+  if (argv1) {
+    return path.isAbsolute(argv1) ? argv1 : path.resolve(process.cwd(), argv1);
+  }
+  return null;
+}
+
 function printSessionUpdate(notification: SessionNotification): void {
   const update = notification.update;
   if (!("sessionUpdate" in update)) {
@@ -263,15 +333,43 @@ export async function createAcpClient(opts: AcpClientOptions = {}): Promise<AcpC
   const verbose = Boolean(opts.verbose);
   const log = verbose ? (msg: string) => console.error(`[acp-client] ${msg}`) : () => {};
 
-  ensureOpenClawCliOnPath({ cwd });
-  const serverCommand = opts.serverCommand ?? "openclaw";
+  ensureOpenClawCliOnPath();
   const serverArgs = buildServerArgs(opts);
 
-  log(`spawning: ${serverCommand} ${serverArgs.join(" ")}`);
+  const entryPath = resolveSelfEntryPath();
+  const defaultServerCommand = entryPath ? process.execPath : "openclaw";
+  const defaultServerArgs = entryPath ? [entryPath, ...serverArgs] : serverArgs;
+  const serverCommand = opts.serverCommand ?? defaultServerCommand;
+  const effectiveArgs = opts.serverCommand || !entryPath ? serverArgs : defaultServerArgs;
+  const { getActiveSkillEnvKeys } = await import("../agents/skills/env-overrides.runtime.js");
+  const stripProviderAuthEnvVars = shouldStripProviderAuthEnvVarsForAcpServer({
+    serverCommand,
+    serverArgs: effectiveArgs,
+    defaultServerCommand,
+    defaultServerArgs,
+  });
+  const stripKeys = buildAcpClientStripKeys({
+    stripProviderAuthEnvVars,
+    activeSkillEnvKeys: getActiveSkillEnvKeys(),
+  });
+  const spawnEnv = resolveAcpClientSpawnEnv(process.env, { stripKeys });
+  const spawnInvocation = resolveAcpClientSpawnInvocation(
+    { serverCommand, serverArgs: effectiveArgs },
+    {
+      platform: process.platform,
+      env: spawnEnv,
+      execPath: process.execPath,
+    },
+  );
 
-  const agent = spawn(serverCommand, serverArgs, {
+  log(`spawning: ${spawnInvocation.command} ${spawnInvocation.args.join(" ")}`);
+
+  const agent = spawn(spawnInvocation.command, spawnInvocation.args, {
     stdio: ["pipe", "pipe", "inherit"],
     cwd,
+    env: spawnEnv,
+    shell: spawnInvocation.shell,
+    windowsHide: spawnInvocation.windowsHide,
   });
 
   if (!agent.stdin || !agent.stdout) {
@@ -288,7 +386,7 @@ export async function createAcpClient(opts: AcpClientOptions = {}): Promise<AcpC
         printSessionUpdate(params);
       },
       requestPermission: async (params: RequestPermissionRequest) => {
-        return resolvePermissionRequest(params);
+        return resolvePermissionRequest(params, { cwd });
       },
     }),
     stream,
