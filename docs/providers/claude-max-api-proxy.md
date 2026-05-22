@@ -4,10 +4,8 @@ read_when:
   - You want to use Claude Max subscription with OpenAI-compatible tools
   - You want a local API server that wraps Claude Code CLI
   - You want to evaluate subscription-based vs API-key-based Anthropic access
-title: "Claude Max API Proxy"
+title: "Claude Max API proxy"
 ---
-
-# Claude Max API Proxy
 
 **claude-max-api-proxy** is a community tool that exposes your Claude Max/Pro subscription as an OpenAI-compatible API endpoint. This allows you to use your subscription with any tool that supports the OpenAI API format.
 
@@ -97,7 +95,7 @@ The proxy:
   </Step>
 </Steps>
 
-## Available models
+## Built-in catalog
 
 | Model ID          | Maps To         |
 | ----------------- | --------------- |
@@ -105,7 +103,7 @@ The proxy:
 | `claude-sonnet-4` | Claude Sonnet 4 |
 | `claude-haiku-4`  | Claude Haiku 4  |
 
-## Advanced
+## Advanced configuration
 
 <AccordionGroup>
   <Accordion title="Proxy-style OpenAI-compatible notes">
@@ -155,12 +153,6 @@ The proxy:
   </Accordion>
 </AccordionGroup>
 
-## Links
-
-- **npm:** [https://www.npmjs.com/package/claude-max-api-proxy](https://www.npmjs.com/package/claude-max-api-proxy)
-- **GitHub:** [https://github.com/atalovesyou/claude-max-api-proxy](https://github.com/atalovesyou/claude-max-api-proxy)
-- **Issues:** [https://github.com/atalovesyou/claude-max-api-proxy/issues](https://github.com/atalovesyou/claude-max-api-proxy/issues)
-
 ## Notes
 
 - This is a **community tool**, not officially supported by Anthropic or OpenClaw
@@ -181,7 +173,7 @@ For native Anthropic integration with Claude CLI or API keys, see [Anthropic pro
   <Card title="OpenAI provider" href="/providers/openai" icon="robot">
     For OpenAI/Codex subscriptions.
   </Card>
-  <Card title="Model providers" href="/concepts/model-providers" icon="layers">
+  <Card title="Model selection" href="/concepts/model-providers" icon="layers">
     Overview of all providers, model refs, and failover behavior.
   </Card>
   <Card title="Configuration" href="/gateway/configuration" icon="gear">

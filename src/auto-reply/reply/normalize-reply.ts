@@ -69,7 +69,7 @@ export function normalizeReplyPayload(
     if (hasLeadingSilentToken) {
       text = stripLeadingSilentToken(text, silentToken);
     }
-    if (hasLeadingSilentToken || text.includes(silentToken)) {
+    if (hasLeadingSilentToken || text.toLowerCase().includes(silentToken.toLowerCase())) {
       text = stripSilentToken(text, silentToken);
       if (!hasContent(text)) {
         opts.onSkip?.("silent");
@@ -105,7 +105,11 @@ export function normalizeReplyPayload(
 
   let enrichedPayload: ReplyPayload = { ...payload, text };
   if (applyChannelTransforms && opts.transformReplyPayload) {
-    enrichedPayload = opts.transformReplyPayload(enrichedPayload) ?? enrichedPayload;
+    const transformedPayload = opts.transformReplyPayload(enrichedPayload);
+    if (transformedPayload === null) {
+      return null;
+    }
+    enrichedPayload = transformedPayload ?? enrichedPayload;
     text = enrichedPayload.text;
   }
 
