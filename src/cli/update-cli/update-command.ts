@@ -74,7 +74,6 @@ import {
   createGlobalInstallEnv,
   cleanupGlobalRenameDirs,
   globalInstallArgs,
-  isOpenClawSourcePackageInstallSpec,
   resolveGlobalInstallTarget,
   resolveGlobalInstallSpec,
   resolvePnpmGlobalDirFromGlobalRoot,
@@ -1023,14 +1022,6 @@ async function resolvePackageRuntimePreflightError(params: {
       : "Upgrade Node to 22.19+ or Node 24, then rerun `openclaw update`.",
     "Bare `npm i -g openclaw` can silently install an older compatible release.",
     "After upgrading Node, use `npm i -g openclaw@latest`.",
-  ].join("\n");
-}
-
-function formatUnsupportedOpenClawSourcePackageTargetMessage(target: string): string {
-  return [
-    `Unsupported package update target: ${target}.`,
-    "OpenClaw package updates use published npm artifacts or built tarballs; npm GitHub source installs for openclaw/openclaw do not reliably produce an installable package.",
-    "Use `openclaw update --channel dev` for the moving main checkout, or target `latest`, `beta`, an exact version, or a built `.tgz` package spec.",
   ].join("\n");
 }
 
@@ -2759,6 +2750,7 @@ async function continuePostCoreUpdateInFreshProcess(params: {
       stdio: childStdio,
       env: {
         ...stripGatewayServiceMarkerEnv(disableUpdatedPackageCompileCacheEnv(process.env)),
+        OPENCLAW_UPDATE_IN_PROGRESS: "1",
         [POST_CORE_UPDATE_ENV]: "1",
         [POST_CORE_UPDATE_CHANNEL_ENV]: params.channel,
         ...(params.requestedChannel
@@ -2915,7 +2907,25 @@ async function markControlPlaneUpdateRestartSentinelFailureBestEffort(params: {
   }
 }
 
+async function withUpdateInProgressEnv<T>(run: () => Promise<T>): Promise<T> {
+  const previousUpdateInProgress = process.env.OPENCLAW_UPDATE_IN_PROGRESS;
+  process.env.OPENCLAW_UPDATE_IN_PROGRESS = "1";
+  return run().finally(() => {
+    if (previousUpdateInProgress === undefined) {
+      delete process.env.OPENCLAW_UPDATE_IN_PROGRESS;
+    } else {
+      process.env.OPENCLAW_UPDATE_IN_PROGRESS = previousUpdateInProgress;
+    }
+  });
+}
+
 export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
+  return await withUpdateInProgressEnv(async () => {
+    await updateCommandInternal(opts);
+  });
+}
+
+async function updateCommandInternal(opts: UpdateCommandOptions): Promise<void> {
   suppressDeprecations();
   await cleanupStaleManagedServiceUpdateHandoffs().catch(() => undefined);
   const invocationCwd = tryResolveInvocationCwd();
@@ -2959,7 +2969,10 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
 
     process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION = (await readPackageVersion(root)) ?? VERSION;
 
-    let postCoreConfigSnapshot = await readConfigFileSnapshot({ skipPluginValidation: true });
+    let postCoreConfigSnapshot = await readConfigFileSnapshot({
+      skipPluginValidation: true,
+      suppressFutureVersionWarning: true,
+    });
     const preUpdateSourceConfig = await readPostCorePreUpdateSourceConfig({
       sourceConfigPath: process.env[POST_CORE_UPDATE_SOURCE_CONFIG_PATH_ENV],
       currentSnapshot: postCoreConfigSnapshot,
@@ -3150,11 +3163,6 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
       tag,
       env: process.env,
     });
-    if (isOpenClawSourcePackageInstallSpec(packageInstallSpec)) {
-      defaultRuntime.error(formatUnsupportedOpenClawSourcePackageTargetMessage(packageInstallSpec));
-      defaultRuntime.exit(1);
-      return;
-    }
   }
 
   if (opts.dryRun) {
@@ -3430,7 +3438,10 @@ export async function updateCommand(opts: UpdateCommandOptions): Promise<void> {
 
   let postUpdateConfigSnapshot =
     result.status === "ok" && !opts.dryRun
-      ? await readConfigFileSnapshot({ skipPluginValidation: true })
+      ? await readConfigFileSnapshot({
+          skipPluginValidation: true,
+          suppressFutureVersionWarning: shouldResumePostCoreInFreshProcess,
+        })
       : configSnapshot;
   if (!shouldResumePostCoreInFreshProcess) {
     postUpdateConfigSnapshot = await persistRequestedUpdateChannel({

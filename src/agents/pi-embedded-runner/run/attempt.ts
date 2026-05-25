@@ -261,7 +261,11 @@ import {
   resolveEmbeddedAgentStreamFn,
 } from "../stream-resolution.js";
 import { applySystemPromptOverrideToSession } from "../system-prompt.js";
-import { dropReasoningFromHistory, dropThinkingBlocks } from "../thinking.js";
+import {
+  dropReasoningFromHistory,
+  dropThinkingBlocks,
+  wrapAnthropicStreamWithRecovery,
+} from "../thinking.js";
 import {
   collectAllowedToolNames,
   collectCoreBuiltinToolNames,
@@ -396,6 +400,7 @@ import {
 } from "./midturn-precheck.js";
 import {
   PREEMPTIVE_OVERFLOW_ERROR_TEXT,
+  buildPrePromptContextBudgetStatus,
   formatPrePromptPrecheckLog,
   shouldPreemptivelyCompactBeforePrompt,
 } from "./preemptive-compaction.js";
@@ -2221,6 +2226,7 @@ export async function runEmbeddedAttempt(
       const extensionFactories = buildEmbeddedExtensionFactories({
         cfg: params.config,
         sessionManager,
+        workspaceDir: effectiveWorkspace,
         provider: params.provider,
         modelId: params.modelId,
         model: params.model,
@@ -2471,6 +2477,7 @@ export async function runEmbeddedAttempt(
         }
         return Promise.allSettled(promises).then(() => undefined);
       };
+      let heartbeatResponseTerminated = false;
       abortSessionForYield = () => {
         yieldAbortSettled = abortActiveSession();
       };
@@ -2497,26 +2504,21 @@ export async function runEmbeddedAttempt(
       const onMidTurnPrecheck = (request: MidTurnPrecheckRequest) => {
         pendingMidTurnPrecheckRequest = request;
       };
-      if (!activeContextEngine || activeContextEngine.info.ownsCompaction !== true) {
-        removeToolResultContextGuard = installToolResultContextGuard({
-          agent: activeSession.agent,
-          contextWindowTokens: contextTokenBudgetForGuard,
-          ...(midTurnPrecheckEnabled
-            ? {
-                midTurnPrecheck: {
-                  enabled: true,
-                  contextTokenBudget: contextTokenBudgetForGuard,
-                  reserveTokens: () => settingsManager.getCompactionReserveTokens(),
-                  toolResultMaxChars: toolResultMaxCharsForGuard,
-                  getSystemPrompt: () => systemPromptText,
-                  getPrePromptMessageCount: () => prePromptMessageCount,
-                  onMidTurnPrecheck,
-                },
-              }
-            : {}),
-        });
-      } else {
-        removeToolResultContextGuard = installContextEngineLoopHook({
+      const midTurnPrecheckOptions = midTurnPrecheckEnabled
+        ? {
+            midTurnPrecheck: {
+              enabled: true,
+              contextTokenBudget: contextTokenBudgetForGuard,
+              reserveTokens: () => settingsManager.getCompactionReserveTokens(),
+              toolResultMaxChars: toolResultMaxCharsForGuard,
+              getSystemPrompt: () => systemPromptText,
+              getPrePromptMessageCount: () => prePromptMessageCount,
+              onMidTurnPrecheck,
+            },
+          }
+        : {};
+      if (activeContextEngine?.info.ownsCompaction === true) {
+        const removeContextEngineLoopHook = installContextEngineLoopHook({
           agent: activeSession.agent,
           contextEngine: activeContextEngine,
           sessionId: params.sessionId,
@@ -2546,6 +2548,21 @@ export async function runEmbeddedAttempt(
                   }),
                 }),
             }),
+        });
+        const removeGuard = installToolResultContextGuard({
+          agent: activeSession.agent,
+          contextWindowTokens: contextTokenBudgetForGuard,
+          ...midTurnPrecheckOptions,
+        });
+        removeToolResultContextGuard = () => {
+          removeGuard();
+          removeContextEngineLoopHook();
+        };
+      } else {
+        removeToolResultContextGuard = installToolResultContextGuard({
+          agent: activeSession.agent,
+          contextWindowTokens: contextTokenBudgetForGuard,
+          ...midTurnPrecheckOptions,
         });
       }
       const removeLoopContextGuard = removeToolResultContextGuard;
@@ -2768,10 +2785,10 @@ export async function runEmbeddedAttempt(
         activeSession.agent.streamFn = cacheTrace.wrapStreamFn(activeSession.agent.streamFn);
       }
 
-      // Anthropic Claude endpoints can reject replayed `thinking` blocks
-      // (e.g. thinkingSignature:"reasoning_text") on any follow-up provider
-      // call, including tool continuations. Wrap the stream function so every
-      // outbound request sees sanitized messages.
+      // Anthropic Claude endpoints can reject replayed `thinking` blocks on
+      // any follow-up provider call, including tool continuations. Sanitize
+      // outbound messages where policy allows rewriting; otherwise preserve
+      // latest thinking and let the recovery wrapper retry once without it.
       if (transcriptPolicy.dropThinkingBlocks || transcriptPolicy.dropReasoningFromHistory) {
         const inner = activeSession.agent.streamFn;
         activeSession.agent.streamFn = (model, context, options) => {
@@ -2795,6 +2812,18 @@ export async function runEmbeddedAttempt(
           } as unknown;
           return inner(model, nextContext as typeof context, options);
         };
+      }
+      if (
+        transcriptPolicy.preserveSignatures ||
+        transcriptPolicy.dropThinkingBlocks ||
+        transcriptPolicy.dropReasoningFromHistory
+      ) {
+        activeSession.agent.streamFn = wrapAnthropicStreamWithRecovery(
+          activeSession.agent.streamFn,
+          {
+            id: activeSession.sessionId,
+          },
+        );
       }
 
       // Mistral (and other strict providers) reject tool call IDs that don't match their
@@ -2828,6 +2857,7 @@ export async function runEmbeddedAttempt(
             preserveNativeAnthropicToolUseIds: transcriptPolicy.preserveNativeAnthropicToolUseIds,
             preserveReplaySafeThinkingToolCallIds: shouldAllowProviderOwnedThinkingReplay({
               modelApi: (model as { api?: unknown })?.api as string | null | undefined,
+              provider: params.provider,
               policy: transcriptPolicy,
             }),
             repairToolUseResultPairing: transcriptPolicy.repairToolUseResultPairing,
@@ -2884,6 +2914,7 @@ export async function runEmbeddedAttempt(
         activeSession.agent.streamFn,
         allowedToolNames,
         transcriptPolicy,
+        params.provider,
       );
       activeSession.agent.streamFn = wrapStreamFnTrimToolCallNames(
         activeSession.agent.streamFn,
@@ -3249,6 +3280,16 @@ export async function runEmbeddedAttempt(
           onAssistantMessageStart: params.onAssistantMessageStart,
           onExecutionPhase: params.onExecutionPhase,
           onAgentEvent: params.onAgentEvent,
+          onHeartbeatToolResponse:
+            params.trigger === "heartbeat"
+              ? () => {
+                  if (heartbeatResponseTerminated) {
+                    return;
+                  }
+                  heartbeatResponseTerminated = true;
+                  void abortActiveSession();
+                }
+              : undefined,
           terminalLifecyclePhase: params.deferTerminalLifecycleEnd ? "finishing" : "end",
           onBeforeLifecycleTerminal: () => {
             // Clear embedded-run activity before emitting terminal lifecycle events so
@@ -3278,6 +3319,7 @@ export async function runEmbeddedAttempt(
         getMessagingToolSentTexts,
         getMessagingToolSentMediaUrls,
         getMessagingToolSentTargets,
+        getMessagingToolSourceReplyPayloads,
         getHeartbeatToolResponse,
         getPendingToolMediaReply,
         getVisibleBlockReplyCount,
@@ -3359,6 +3401,7 @@ export async function runEmbeddedAttempt(
       let cacheBreak: PromptCacheBreak | null = null;
       let promptCache: EmbeddedRunAttemptResult["promptCache"];
       let lastCallUsage: NormalizedUsage | undefined;
+      let contextBudgetStatus: EmbeddedRunAttemptResult["contextBudgetStatus"];
       let compactionOccurredThisAttempt = false;
       let finalPromptText: string | undefined;
       if (params.replyOperation) {
@@ -4055,6 +4098,19 @@ export async function runEmbeddedAttempt(
                 }),
               });
           if (preemptiveCompaction) {
+            contextBudgetStatus = buildPrePromptContextBudgetStatus({
+              result: preemptiveCompaction,
+              provider: params.provider,
+              modelId: params.modelId,
+              messageCount: activeSession.messages.length,
+              contextTokenBudget,
+              reserveTokens,
+              ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+              ...(contextEnginePromptAuthority === "preassembly_may_overflow" &&
+              unwindowedContextEngineMessagesForPrecheck
+                ? { unwindowedMessageCount: unwindowedContextEngineMessagesForPrecheck.length }
+                : {}),
+            });
             log.debug(
               formatPrePromptPrecheckLog({
                 result: preemptiveCompaction,
@@ -4197,6 +4253,9 @@ export async function runEmbeddedAttempt(
                 await persistSessionsYieldContextMessage(activeSession, yieldMessage);
               }
             });
+          } else if (heartbeatResponseTerminated && isRunnerAbortError(err)) {
+            aborted = false;
+            await sessionLockController.waitForSessionEvents(activeSession);
           } else if (isMidTurnPrecheckSignal(err)) {
             await sessionLockController.waitForSessionEvents(activeSession);
             await sessionLockController.withSessionWriteLock(() => {
@@ -4564,10 +4623,19 @@ export async function runEmbeddedAttempt(
 
       const toolMetasNormalized = toolMetas
         .filter(
-          (entry): entry is { toolName: string; meta?: string } =>
+          (entry): entry is { toolName: string; meta?: string; asyncStarted?: boolean } =>
             typeof entry.toolName === "string" && entry.toolName.trim().length > 0,
         )
-        .map((entry) => ({ toolName: entry.toolName, meta: entry.meta }));
+        .map((entry) => {
+          const normalized: { toolName: string; meta?: string; asyncStarted?: boolean } = {
+            toolName: entry.toolName,
+            meta: entry.meta,
+          };
+          if (entry.asyncStarted === true) {
+            normalized.asyncStarted = true;
+          }
+          return normalized;
+        });
       if (cacheObservabilityEnabled) {
         const cacheBreakForLog = cacheBreak as PromptCacheBreak | null;
         if (cacheBreakForLog) {
@@ -4694,6 +4762,7 @@ export async function runEmbeddedAttempt(
       const didSendDeterministicApprovalPromptNow = didSendDeterministicApprovalPrompt();
       const lastToolError = getLastToolError?.();
       const heartbeatToolResponse = getHeartbeatToolResponse();
+      const messagingToolSourceReplyPayloads = getMessagingToolSourceReplyPayloads();
       const pendingToolMediaPayloadCount = hasVisiblePendingToolMediaReply(pendingToolMediaReply)
         ? 1
         : 0;
@@ -4715,6 +4784,7 @@ export async function runEmbeddedAttempt(
       const synthesizedPayloadCount =
         visibleBlockReplyCount +
         pendingToolMediaPayloadCount +
+        messagingToolSourceReplyPayloads.length +
         (silentToolResultReplyPayload ? 1 : 0);
       const emptyAssistantReplyIsSilent = shouldTreatEmptyAssistantReplyAsSilent({
         allowEmptyAssistantReplyAsSilent: params.allowEmptyAssistantReplyAsSilent,
@@ -4737,6 +4807,7 @@ export async function runEmbeddedAttempt(
           replayMetadata,
           promptErrorSource,
           timedOutDuringCompaction,
+          toolMetas: toolMetasNormalized,
         },
       });
       const terminalAssistantTexts = resolveTerminalAssistantTexts({
@@ -4856,6 +4927,7 @@ export async function runEmbeddedAttempt(
         messagingToolSentTexts: getMessagingToolSentTexts(),
         messagingToolSentMediaUrls: getMessagingToolSentMediaUrls(),
         messagingToolSentTargets: getMessagingToolSentTargets(),
+        messagingToolSourceReplyPayloads,
         heartbeatToolResponse,
         toolMediaUrls: pendingToolMediaReply?.mediaUrls,
         toolAudioAsVoice: pendingToolMediaReply?.audioAsVoice,
@@ -4866,6 +4938,7 @@ export async function runEmbeddedAttempt(
         ),
         attemptUsage,
         promptCache,
+        contextBudgetStatus,
         compactionCount: getCompactionCount(),
         compactionTokensAfter: getLastCompactionTokensAfter(),
         // Client tool calls detected (OpenResponses hosted tools).
