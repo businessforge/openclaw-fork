@@ -18,6 +18,8 @@ import {
   type ResolvedGlobalInstallTarget,
 } from "./update-global.js";
 
+const PACKAGE_MANAGER_SWAP_SOURCE_HARDLINKS = "allow" as const;
+
 export type PackageUpdateStepResult = {
   name: string;
   command: string;
@@ -333,7 +335,7 @@ async function replaceNpmBinShims(params: {
   targetLayout: NpmGlobalPrefixLayout;
   packageName: string;
 }): Promise<void> {
-  let entries: string[] = [];
+  let entries: string[];
   try {
     entries = await fs.readdir(params.stageLayout.binDir);
   } catch {
@@ -423,14 +425,14 @@ async function swapStagedNpmInstall(params: {
     if (await pathExists(targetPackageRoot)) {
       await movePathWithCopyFallback({
         from: targetPackageRoot,
-        sourceHardlinks: "reject",
+        sourceHardlinks: PACKAGE_MANAGER_SWAP_SOURCE_HARDLINKS,
         to: backupRoot,
       });
       movedExisting = true;
     }
     await movePathWithCopyFallback({
       from: params.stage.packageRoot,
-      sourceHardlinks: "reject",
+      sourceHardlinks: PACKAGE_MANAGER_SWAP_SOURCE_HARDLINKS,
       to: targetPackageRoot,
     });
     movedStaged = true;
@@ -462,7 +464,7 @@ async function swapStagedNpmInstall(params: {
     if (movedExisting) {
       await movePathWithCopyFallback({
         from: backupRoot,
-        sourceHardlinks: "reject",
+        sourceHardlinks: PACKAGE_MANAGER_SWAP_SOURCE_HARDLINKS,
         to: targetPackageRoot,
       }).catch(() => undefined);
     }
@@ -497,7 +499,7 @@ export async function runGlobalPackageUpdateSteps(params: {
 }> {
   const installCwd = params.installCwd === undefined ? {} : { cwd: params.installCwd };
   const installEnv = params.env === undefined ? {} : { env: params.env };
-  let stagedInstall: StagedNpmInstall | null = null;
+  let stagedInstall: StagedNpmInstall | null | undefined;
   let packedInstallDir: string | null = null;
 
   try {
@@ -677,7 +679,7 @@ export async function runGlobalPackageUpdateSteps(params: {
       failedStep,
     };
   } finally {
-    await cleanupStagedNpmInstall(stagedInstall);
+    await cleanupStagedNpmInstall(stagedInstall ?? null);
     if (packedInstallDir) {
       await removePathBestEffort(packedInstallDir);
     }
