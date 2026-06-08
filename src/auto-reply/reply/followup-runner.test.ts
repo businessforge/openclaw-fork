@@ -1,3 +1,4 @@
+// Tests follow-up runner delivery, transcript persistence, and no-reply contracts.
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -1109,6 +1110,7 @@ describe("createFollowupRunner runtime config", () => {
     await runner(
       createQueuedRun({
         currentInboundEventKind: "room_event",
+        currentInboundAudio: true,
         currentInboundContext: { text: "[OpenClaw room event]" },
         run: {
           config: runtimeConfig,
@@ -1125,6 +1127,7 @@ describe("createFollowupRunner runtime config", () => {
     expect(runCliAgentMock).toHaveBeenCalledOnce();
     const call = requireLastMockCallArg(runCliAgentMock, "run cli agent");
     expect(call.currentInboundEventKind).toBe("room_event");
+    expect(call.currentInboundAudio).toBe(true);
     expect(call.suppressNextUserMessagePersistence).toBe(true);
     expect(call.cliSessionId).toBe("cli-session-1");
     expect(call.cliSessionBinding).toEqual({ sessionId: "cli-session-1" });
@@ -1377,6 +1380,74 @@ describe("createFollowupRunner runtime config", () => {
     expect(onToolStart).not.toHaveBeenCalled();
   });
 
+  it("bridges queued CLI inter-tool commentary into onItemEvent for live preview", async () => {
+    const realAgentEvents = await vi.importActual<typeof import("../../infra/agent-events.js")>(
+      "../../infra/agent-events.js",
+    );
+    const runtimeConfig: OpenClawConfig = {
+      agents: {
+        defaults: {
+          cliBackends: {
+            "claude-cli": { command: "claude" },
+          },
+          models: {
+            "anthropic/claude-opus-4-7": { agentRuntime: { id: "claude-cli" } },
+          },
+        },
+      },
+    };
+    const onItemEvent = vi.fn(async () => {});
+    runCliAgentMock.mockImplementationOnce(async (params: { runId: string }) => {
+      realAgentEvents.emitAgentEvent({
+        runId: params.runId,
+        stream: "item",
+        data: {
+          kind: "preamble",
+          itemId: "commentary-1",
+          progressText: "Let me check the files.",
+        },
+      });
+      return {
+        payloads: [{ text: "final" }],
+        meta: {
+          agentMeta: {
+            provider: "claude-cli",
+            model: "claude-opus-4-7",
+          },
+        },
+      };
+    });
+
+    const runner = createFollowupRunner({
+      opts: { onItemEvent },
+      typing: createMockTypingController(),
+      typingMode: "instant",
+      defaultModel: "anthropic/claude-opus-4-7",
+    });
+
+    await runner(
+      createQueuedRun({
+        originatingChannel: "telegram",
+        run: {
+          config: runtimeConfig,
+          provider: "anthropic",
+          model: "claude-opus-4-7",
+          messageProvider: "telegram",
+          sourceReplyDeliveryMode: "message_tool_only",
+          verboseLevel: "on",
+        },
+      }),
+    );
+
+    expect(onItemEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "preamble",
+        progressText: "Let me check the files.",
+        itemId: "commentary-1",
+      }),
+    );
+  });
+
   it("defers queued CLI attempt terminal lifecycle events until fallback settles", async () => {
     const realAgentEvents = await vi.importActual<typeof import("../../infra/agent-events.js")>(
       "../../infra/agent-events.js",
@@ -1560,6 +1631,7 @@ describe("createFollowupRunner runtime config", () => {
     await runner(
       createQueuedRun({
         currentInboundEventKind: "room_event",
+        currentInboundAudio: true,
         abortSignal: abortController.signal,
         run: {
           provider: "openai",
@@ -1578,6 +1650,7 @@ describe("createFollowupRunner runtime config", () => {
     expect(fallbackCall.abortSignal).not.toBe(abortController.signal);
     expect(fallbackCall.sessionId).toBe("session");
     expect(call.abortSignal).toBe(fallbackCall.abortSignal);
+    expect(call.currentInboundAudio).toBe(true);
   });
 
   it("does not inherit source abort signals for queued user followups", async () => {

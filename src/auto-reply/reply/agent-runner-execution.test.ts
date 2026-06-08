@@ -1,5 +1,9 @@
+// Tests agent runner execution setup, command args, and model fallback routing.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { OAuthRefreshFailureError } from "../../agents/auth-profiles/oauth-refresh-failure.js";
+import { FailoverError } from "../../agents/failover-error.js";
 import { LiveSessionModelSwitchError } from "../../agents/live-model-switch-error.js";
+import { MissingProviderAuthError } from "../../agents/model-auth.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { ModelDefinitionConfig } from "../../config/types.models.js";
 import { CommandLaneClearedError, GatewayDrainingError } from "../../process/command-queue.js";
@@ -19,7 +23,10 @@ import {
   resolveRunAfterAutoFallbackPrimaryProbeRecheck,
 } from "./agent-runner-execution.js";
 import { HEARTBEAT_EXTERNAL_RUN_FAILURE_TEXT } from "./agent-runner-failure-copy.js";
-import { PROVIDER_CONVERSATION_STATE_ERROR_USER_MESSAGE } from "./provider-request-error-classifier.js";
+import {
+  PROVIDER_CONVERSATION_STATE_ERROR_USER_MESSAGE,
+  PROVIDER_RATE_LIMIT_OR_QUOTA_ERROR_USER_MESSAGE,
+} from "./provider-request-error-classifier.js";
 import type { FollowupRun } from "./queue.js";
 import type { ReplyOperation } from "./reply-run-registry.js";
 import type { TypingSignaler } from "./typing-mode.js";
@@ -94,31 +101,36 @@ vi.mock("../../agents/bootstrap-budget.js", () => ({
   resolveBootstrapWarningSignaturesSeen: () => [],
 }));
 
-vi.mock("../../agents/embedded-agent-helpers.js", () => ({
-  BILLING_ERROR_USER_MESSAGE: "billing",
-  formatRateLimitOrOverloadedErrorCopy: (message: string) => {
-    if (/model\s+(?:is\s+)?at capacity/i.test(message)) {
-      return "⚠️ Selected model is at capacity. Try a different model, or wait and retry.";
-    }
-    if (/rate.limit|too many requests|429/i.test(message)) {
-      return "⚠️ API rate limit reached. Please try again later.";
-    }
-    if (/overloaded/i.test(message)) {
-      return "The AI service is temporarily overloaded. Please try again in a moment.";
-    }
-    return undefined;
-  },
-  isCompactionFailureError: (message?: string) => state.isCompactionFailureErrorMock(message),
-  isContextOverflowError: (message?: string) => state.isContextOverflowErrorMock(message),
-  isBillingErrorMessage: () => false,
-  isLikelyContextOverflowError: (message?: string) =>
-    state.isLikelyContextOverflowErrorMock(message),
-  isOverloadedErrorMessage: (message: string) => /overloaded|capacity/i.test(message),
-  isRateLimitErrorMessage: (message: string) =>
-    /rate.limit|too many requests|429|usage limit/i.test(message),
-  isTransientHttpError: () => false,
-  sanitizeUserFacingText: (text?: string) => text ?? "",
-}));
+vi.mock("../../agents/embedded-agent-helpers.js", async () => {
+  const actual = await vi.importActual<typeof import("../../agents/embedded-agent-helpers.js")>(
+    "../../agents/embedded-agent-helpers.js",
+  );
+  return {
+    BILLING_ERROR_USER_MESSAGE: "billing",
+    formatRateLimitOrOverloadedErrorCopy: (message: string) => {
+      if (/model\s+(?:is\s+)?at capacity/i.test(message)) {
+        return "⚠️ Selected model is at capacity. Try a different model, or wait and retry.";
+      }
+      if (/rate.limit|too many requests|429/i.test(message)) {
+        return "⚠️ API rate limit reached. Please try again later.";
+      }
+      if (/overloaded/i.test(message)) {
+        return "The AI service is temporarily overloaded. Please try again in a moment.";
+      }
+      return undefined;
+    },
+    isCompactionFailureError: (message?: string) => state.isCompactionFailureErrorMock(message),
+    isContextOverflowError: (message?: string) => state.isContextOverflowErrorMock(message),
+    isBillingErrorMessage: actual.isBillingErrorMessage,
+    isLikelyContextOverflowError: (message?: string) =>
+      state.isLikelyContextOverflowErrorMock(message),
+    isOverloadedErrorMessage: (message: string) => /overloaded|capacity/i.test(message),
+    isRateLimitErrorMessage: (message: string) =>
+      /rate.limit|too many requests|429|usage limit/i.test(message),
+    isTransientHttpError: () => false,
+    sanitizeUserFacingText: (text?: string) => text ?? "",
+  };
+});
 
 vi.mock("../../config/sessions.js", () => ({
   resolveGroupSessionKey: vi.fn(() => null),
@@ -430,6 +442,28 @@ function createMinimalRunAgentTurnParams(overrides?: {
     getActiveSessionEntry: () => undefined,
     resolvedVerboseLevel: "off" as const,
   };
+}
+
+const NON_DIRECT_FAILURE_SURFACE_CASES = [
+  { label: "Discord group", provider: "discord", chatType: "group" },
+  { label: "Discord channel", provider: "discord", chatType: "channel" },
+  { label: "Slack channel", provider: "slack", chatType: "channel" },
+  { label: "Telegram group", provider: "telegram", chatType: "group" },
+  { label: "WhatsApp group", provider: "whatsapp", chatType: "group" },
+  { label: "Microsoft Teams channel", provider: "msteams", chatType: "channel" },
+] as const;
+
+function createNonDirectFailureSessionCtx(
+  testCase: (typeof NON_DIRECT_FAILURE_SURFACE_CASES)[number],
+): TemplateContext {
+  return {
+    Provider: testCase.provider,
+    Surface: testCase.provider,
+    ChatType: testCase.chatType,
+    GroupSubject: `${testCase.label} fixture`,
+    GroupChannel: "#general",
+    MessageSid: "msg",
+  } as unknown as TemplateContext;
 }
 
 describe("computeContextAwareReserveTokensFloor", () => {
@@ -1155,6 +1189,26 @@ describe("runAgentTurnWithFallback", () => {
     expect(fallbackCall.abortSignal).toBe(replyOperation.abortSignal);
     expect(fallbackCall.sessionId).toBe("session");
     expect(embeddedCall.abortSignal).toBe(replyOperation.abortSignal);
+  });
+
+  it("passes runtime toolsAllow to embedded agent runs", async () => {
+    state.runEmbeddedAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "ok" }],
+      meta: {},
+    });
+
+    const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
+    await runAgentTurnWithFallback(
+      createMinimalRunAgentTurnParams({
+        opts: {
+          toolsAllow: ["message"],
+        },
+      }),
+    );
+
+    expectMockCallArgFields(state.runEmbeddedAgentMock, 0, "embedded run params", {
+      toolsAllow: ["message"],
+    });
   });
 
   it("rechecks queued auto fallback primary probes before running", async () => {
@@ -2351,6 +2405,67 @@ describe("runAgentTurnWithFallback", () => {
     expect(call?.args).toEqual({ command: "ls -la" });
   });
 
+  it("bridges CLI commentary agent events into onItemEvent for live preview", async () => {
+    state.isCliProviderMock.mockReturnValue(true);
+    state.runWithModelFallbackMock.mockImplementationOnce(async (params: FallbackRunnerParams) => ({
+      result: await params.run("claude-cli", "claude-opus-4-6"),
+      provider: "claude-cli",
+      model: "claude-opus-4-6",
+      attempts: [],
+    }));
+    state.runCliAgentMock.mockImplementationOnce(async (params: { runId: string }) => {
+      const realAgentEvents = await vi.importActual<typeof import("../../infra/agent-events.js")>(
+        "../../infra/agent-events.js",
+      );
+      // Inter-tool commentary surfaces as a stream:"item", kind:"preamble" agent event.
+      realAgentEvents.emitAgentEvent({
+        runId: params.runId,
+        stream: "item",
+        data: {
+          kind: "preamble",
+          itemId: "commentary-1",
+          progressText: "Let me check the files.",
+        },
+      });
+      return { payloads: [{ text: "done" }], meta: {} };
+    });
+
+    const onItemEvent = vi.fn<NonNullable<GetReplyOptions["onItemEvent"]>>(async () => undefined);
+    const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
+    const followupRun = createFollowupRun();
+    followupRun.run.provider = "claude-cli";
+    followupRun.run.model = "claude-opus-4-6";
+
+    await runAgentTurnWithFallback({
+      commandBody: "hi",
+      followupRun,
+      sessionCtx: { Provider: "telegram", MessageSid: "msg" } as unknown as TemplateContext,
+      opts: { onItemEvent },
+      typingSignals: createMockTypingSignaler(),
+      blockReplyPipeline: null,
+      blockStreamingEnabled: false,
+      resolvedBlockStreamingBreak: "message_end",
+      applyReplyToMode: (payload) => payload,
+      shouldEmitToolResult: () => true,
+      shouldEmitToolOutput: () => false,
+      pendingToolTasks: new Set(),
+      resetSessionAfterRoleOrderingConflict: async () => false,
+      isHeartbeat: false,
+      sessionKey: "main",
+      getActiveSessionEntry: () => undefined,
+      resolvedVerboseLevel: "off",
+    });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+    expect(onItemEvent).toHaveBeenCalledTimes(1);
+    const call = onItemEvent.mock.calls[0]?.[0];
+    expect(call?.kind).toBe("preamble");
+    expect(call?.progressText).toBe("Let me check the files.");
+    expect(call?.itemId).toBe("commentary-1");
+  });
+
   it("does not bridge CLI tool deltas when silentExpected is set", async () => {
     state.isCliProviderMock.mockReturnValue(true);
     state.runWithModelFallbackMock.mockImplementationOnce(async (params: FallbackRunnerParams) => ({
@@ -2925,51 +3040,37 @@ describe("runAgentTurnWithFallback", () => {
     ).toBeUndefined();
   });
 
-  it("surfaces model capacity errors from no-text mid-turn failures", async () => {
-    state.runEmbeddedAgentMock.mockResolvedValueOnce({
-      payloads: [{ text: "thinking", isReasoning: true }],
-      meta: {
-        error: {
-          kind: "server_overloaded",
-          message: "Selected model is at capacity. Please try a different model.",
+  it.each(NON_DIRECT_FAILURE_SURFACE_CASES)(
+    "surfaces model capacity errors from no-text mid-turn failures in $label chats",
+    async (testCase) => {
+      state.runEmbeddedAgentMock.mockResolvedValueOnce({
+        payloads: [{ text: "thinking", isReasoning: true }],
+        meta: {
+          error: {
+            kind: "server_overloaded",
+            message: "Selected model is at capacity. Please try a different model.",
+          },
         },
-      },
-    });
+      });
 
-    const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
-    const result = await runAgentTurnWithFallback({
-      commandBody: "hello",
-      followupRun: createFollowupRun(),
-      sessionCtx: {
-        Provider: "whatsapp",
-        MessageSid: "msg",
-      } as unknown as TemplateContext,
-      opts: {},
-      typingSignals: createMockTypingSignaler(),
-      blockReplyPipeline: null,
-      blockStreamingEnabled: false,
-      resolvedBlockStreamingBreak: "message_end",
-      applyReplyToMode: (payload) => payload,
-      shouldEmitToolResult: () => true,
-      shouldEmitToolOutput: () => false,
-      pendingToolTasks: new Set(),
-      resetSessionAfterRoleOrderingConflict: async () => false,
-      isHeartbeat: false,
-      sessionKey: "main",
-      getActiveSessionEntry: () => undefined,
-      resolvedVerboseLevel: "off",
-    });
+      const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
+      const result = await runAgentTurnWithFallback(
+        createMinimalRunAgentTurnParams({
+          sessionCtx: createNonDirectFailureSessionCtx(testCase),
+        }),
+      );
 
-    expect(result.kind).toBe("success");
-    if (result.kind === "success") {
-      expect(result.runResult.payloads).toEqual([
-        {
-          text: "⚠️ Selected model is at capacity. Try a different model, or wait and retry.",
-          isError: true,
-        },
-      ]);
-    }
-  });
+      expect(result.kind).toBe("success");
+      if (result.kind === "success") {
+        expect(result.runResult.payloads).toEqual([
+          {
+            text: "⚠️ Selected model is at capacity. Try a different model, or wait and retry.",
+            isError: true,
+          },
+        ]);
+      }
+    },
+  );
 
   it("surfaces model capacity errors from pre-reply CLI failures", async () => {
     state.runWithModelFallbackMock.mockRejectedValueOnce(
@@ -3007,6 +3108,7 @@ describe("runAgentTurnWithFallback", () => {
     expect(result).toEqual({
       kind: "final",
       payload: {
+        isError: true,
         text: "⚠️ Selected model is at capacity. Try a different model, or wait and retry.",
       },
     });
@@ -5115,9 +5217,9 @@ describe("runAgentTurnWithFallback", () => {
     }
   });
 
-  it.each(["group", "channel"] as const)(
-    "keeps raw runner failure boilerplate out of Discord %s chats",
-    async (chatType) => {
+  it.each(NON_DIRECT_FAILURE_SURFACE_CASES)(
+    "keeps raw runner failure boilerplate out of $label chats",
+    async (testCase) => {
       state.runEmbeddedAgentMock.mockRejectedValueOnce(
         new Error("openai/gpt-5.5 ended with an incomplete terminal response"),
       );
@@ -5125,14 +5227,7 @@ describe("runAgentTurnWithFallback", () => {
       const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
       const result = await runAgentTurnWithFallback(
         createMinimalRunAgentTurnParams({
-          sessionCtx: {
-            Provider: "discord",
-            Surface: "discord",
-            ChatType: chatType,
-            GroupSubject: "agent group",
-            GroupChannel: "#general",
-            MessageSid: "msg",
-          } as unknown as TemplateContext,
+          sessionCtx: createNonDirectFailureSessionCtx(testCase),
         }),
       );
 
@@ -5222,12 +5317,9 @@ describe("runAgentTurnWithFallback", () => {
     }
   });
 
-  it.each(["group", "channel"] as const)(
-    "keeps default silent behavior in Discord %s chats when silentReply policy is unset",
-    async (chatType) => {
-      // Sanity check: explicit `{}` config (no silentReply) must still resolve
-      // to the documented default `group: "allow"` and produce a silent payload
-      // — the new policy hookup must not regress the default behavior.
+  it.each(NON_DIRECT_FAILURE_SURFACE_CASES)(
+    "keeps default silent behavior in $label chats when silentReply policy is unset",
+    async (testCase) => {
       state.runEmbeddedAgentMock.mockRejectedValueOnce(
         new Error("openai/gpt-5.5 ended with an incomplete terminal response"),
       );
@@ -5239,14 +5331,7 @@ describe("runAgentTurnWithFallback", () => {
       const result = await runAgentTurnWithFallback(
         createMinimalRunAgentTurnParams({
           followupRun,
-          sessionCtx: {
-            Provider: "discord",
-            Surface: "discord",
-            ChatType: chatType,
-            GroupSubject: "agent group",
-            GroupChannel: "#general",
-            MessageSid: "msg",
-          } as unknown as TemplateContext,
+          sessionCtx: createNonDirectFailureSessionCtx(testCase),
         }),
       );
 
@@ -5257,9 +5342,9 @@ describe("runAgentTurnWithFallback", () => {
     },
   );
 
-  it.each(["group", "channel"] as const)(
-    "keeps classified non-transient failures visible in Discord %s chats",
-    async (chatType) => {
+  it.each(NON_DIRECT_FAILURE_SURFACE_CASES)(
+    "keeps classified non-transient failures visible in $label chats",
+    async (testCase) => {
       state.runEmbeddedAgentMock.mockRejectedValueOnce(
         new Error('No API key found for provider "openai"'),
       );
@@ -5267,14 +5352,7 @@ describe("runAgentTurnWithFallback", () => {
       const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
       const result = await runAgentTurnWithFallback(
         createMinimalRunAgentTurnParams({
-          sessionCtx: {
-            Provider: "discord",
-            Surface: "discord",
-            ChatType: chatType,
-            GroupSubject: "agent group",
-            GroupChannel: "#general",
-            MessageSid: "msg",
-          } as unknown as TemplateContext,
+          sessionCtx: createNonDirectFailureSessionCtx(testCase),
         }),
       );
 
@@ -5286,28 +5364,44 @@ describe("runAgentTurnWithFallback", () => {
     },
   );
 
-  it.each(["group", "channel"] as const)(
-    "keeps rate-limit fallback copy out of Discord %s chats",
-    async (chatType) => {
+  it.each(NON_DIRECT_FAILURE_SURFACE_CASES)(
+    "surfaces rate-limit fallback copy in $label chats",
+    async (testCase) => {
       state.runEmbeddedAgentMock.mockRejectedValueOnce(new Error("429 rate limit exceeded"));
 
       const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
       const result = await runAgentTurnWithFallback(
         createMinimalRunAgentTurnParams({
-          sessionCtx: {
-            Provider: "discord",
-            Surface: "discord",
-            ChatType: chatType,
-            GroupSubject: "agent group",
-            GroupChannel: "#general",
-            MessageSid: "msg",
-          } as unknown as TemplateContext,
+          sessionCtx: createNonDirectFailureSessionCtx(testCase),
         }),
       );
 
       expect(result.kind).toBe("final");
       if (result.kind === "final") {
-        expect(result.payload.text).toBe(SILENT_REPLY_TOKEN);
+        expect(result.payload.isError).toBe(true);
+        expect(result.payload.text).not.toBe(SILENT_REPLY_TOKEN);
+        expect(result.payload.text).toContain("rate-limited");
+      }
+    },
+  );
+
+  it.each(NON_DIRECT_FAILURE_SURFACE_CASES)(
+    "surfaces overloaded fallback copy in $label chats",
+    async (testCase) => {
+      state.runEmbeddedAgentMock.mockRejectedValueOnce(new Error("model is overloaded"));
+
+      const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
+      const result = await runAgentTurnWithFallback(
+        createMinimalRunAgentTurnParams({
+          sessionCtx: createNonDirectFailureSessionCtx(testCase),
+        }),
+      );
+
+      expect(result.kind).toBe("final");
+      if (result.kind === "final") {
+        expect(result.payload.isError).toBe(true);
+        expect(result.payload.text).not.toBe(SILENT_REPLY_TOKEN);
+        expect(result.payload.text).toContain("overloaded");
       }
     },
   );
@@ -5341,6 +5435,7 @@ describe("runAgentTurnWithFallback", () => {
 
     expect(result.kind).toBe("final");
     if (result.kind === "final") {
+      expect(result.payload.isError).toBe(true);
       expect(result.payload.text).not.toBe(SILENT_REPLY_TOKEN);
       expect(result.payload.text).toContain("rate-limited");
     }
@@ -5391,6 +5486,58 @@ describe("runAgentTurnWithFallback", () => {
     if (result.kind === "final") {
       expect(result.payload.text).toContain("Agent failed before reply");
       expect(result.payload.text).toContain("incomplete terminal response");
+    }
+  });
+
+  it("surfaces provider quota guidance for generic HTTP 429 failures before reply", async () => {
+    const error = new Error(
+      "Something went wrong while processing your request. Please try again.",
+    );
+    Object.assign(error, { status: 429 });
+    state.runEmbeddedAgentMock.mockRejectedValueOnce(error);
+
+    const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
+    const result = await runAgentTurnWithFallback(
+      createMinimalRunAgentTurnParams({
+        sessionCtx: {
+          Provider: "discord",
+          Surface: "discord",
+          ChatType: "direct",
+          MessageSid: "msg",
+        } as unknown as TemplateContext,
+      }),
+    );
+
+    expect(result.kind).toBe("final");
+    if (result.kind === "final") {
+      expect(result.payload.text).toBe(PROVIDER_RATE_LIMIT_OR_QUOTA_ERROR_USER_MESSAGE);
+      expect(result.payload.text).not.toBe(GENERIC_RUN_FAILURE_TEXT);
+    }
+  });
+
+  it("surfaces billing guidance for Volcengine Coding Plan subscription failures before reply", async () => {
+    state.runEmbeddedAgentMock.mockRejectedValueOnce(
+      new Error(
+        'HTTP 400 Bad Request: {"error":{"code":"InvalidSubscription","message":"Your account does not have a valid CodingPlan subscription, or your subscription has expired."}}',
+      ),
+    );
+
+    const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
+    const result = await runAgentTurnWithFallback(
+      createMinimalRunAgentTurnParams({
+        sessionCtx: {
+          Provider: "discord",
+          Surface: "discord",
+          ChatType: "direct",
+          MessageSid: "msg",
+        } as unknown as TemplateContext,
+      }),
+    );
+
+    expect(result.kind).toBe("final");
+    if (result.kind === "final") {
+      expect(result.payload.text).toBe("billing");
+      expect(result.payload.text).not.toBe(GENERIC_RUN_FAILURE_TEXT);
     }
   });
 
@@ -5596,6 +5743,25 @@ describe("runAgentTurnWithFallback", () => {
     }
   });
 
+  it("surfaces gateway reauth guidance from typed OAuth refresh failures", async () => {
+    state.runEmbeddedAgentMock.mockRejectedValueOnce(
+      new OAuthRefreshFailureError({
+        provider: "openai",
+        message: "invalid_grant",
+      }),
+    );
+
+    const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
+    const result = await runAgentTurnWithFallback(createMinimalRunAgentTurnParams());
+
+    expect(result.kind).toBe("final");
+    if (result.kind === "final") {
+      expect(result.payload.text).toBe(
+        "⚠️ Model login expired on the gateway for openai. Re-auth with `openclaw models auth login --provider openai`, then try again.",
+      );
+    }
+  });
+
   it("surfaces direct provider auth guidance for missing API keys", async () => {
     state.runEmbeddedAgentMock.mockRejectedValueOnce(
       new Error(
@@ -5632,6 +5798,47 @@ describe("runAgentTurnWithFallback", () => {
       expect(result.payload.text).toBe(
         "⚠️ Missing API key for OpenAI on the gateway. Use `openai/gpt-5.5` with the OpenAI OAuth profile, or set `OPENAI_API_KEY` for direct OpenAI API-key runs.",
       );
+    }
+  });
+
+  it("surfaces typed missing API-key auth guidance without parsing the message", async () => {
+    state.runEmbeddedAgentMock.mockRejectedValueOnce(
+      new MissingProviderAuthError("openai", {
+        mode: "api-key",
+        source: "env: OPENAI_API_KEY",
+      }),
+    );
+
+    const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
+    const result = await runAgentTurnWithFallback(createMinimalRunAgentTurnParams());
+
+    expect(result.kind).toBe("final");
+    if (result.kind === "final") {
+      expect(result.payload.text).toBe(
+        '⚠️ Missing API key for provider "openai". Run `openclaw doctor --fix` to repair stale OpenAI model/session routes, restart the gateway if doctor asks, then try again. If doctor has nothing to repair or the error persists, re-auth with `openclaw models auth login --provider openai` or run `openclaw configure`.',
+      );
+    }
+  });
+
+  it("formats auth-profile failover copy from typed FailoverError metadata", async () => {
+    state.runEmbeddedAgentMock.mockRejectedValueOnce(
+      new FailoverError("Auth profile failover exhausted for provider openai", {
+        reason: "auth",
+        provider: "openai",
+        authProfileFailure: { allInCooldown: true },
+        cause: new Error("invalid_grant"),
+      }),
+    );
+
+    const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
+    const result = await runAgentTurnWithFallback(createMinimalRunAgentTurnParams());
+
+    expect(result.kind).toBe("final");
+    if (result.kind === "final") {
+      expect(result.payload.text).toContain("Couldn't sign in to openai.");
+      expect(result.payload.text).toContain("openclaw configure");
+      expect(result.payload.text).toContain("(invalid_grant)");
+      expect(result.payload.text).not.toContain("Auth profile failover exhausted");
     }
   });
 
