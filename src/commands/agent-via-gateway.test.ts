@@ -155,37 +155,11 @@ function createSignalProcess() {
 }
 
 async function waitForAgentCommandCall(expectedCalls = 1) {
-  for (
-    let attempt = 0;
-    attempt < 50 && agentCommand.mock.calls.length < expectedCalls;
-    attempt += 1
-  ) {
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 0);
-    });
-  }
-  expect(agentCommand).toHaveBeenCalledTimes(expectedCalls);
+  await vi.waitFor(() => expect(agentCommand).toHaveBeenCalledTimes(expectedCalls));
 }
 
 async function waitForGatewayCall(expectedCalls = 1) {
-  for (
-    let attempt = 0;
-    attempt < 50 && callGateway.mock.calls.length < expectedCalls;
-    attempt += 1
-  ) {
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 0);
-    });
-  }
-  expect(callGateway).toHaveBeenCalledTimes(expectedCalls);
-}
-
-function createDeferredVoid() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((value) => {
-    resolve = value;
-  });
-  return { promise, resolve };
+  await vi.waitFor(() => expect(callGateway).toHaveBeenCalledTimes(expectedCalls));
 }
 
 function mockMessages(mock: unknown): string[] {
@@ -327,7 +301,7 @@ describe("agentCliCommand", () => {
       expect(request.clientName).toBe("cli");
       expect(request.mode).toBe("cli");
       expect(request).not.toHaveProperty("scopes");
-      expect(request.params).not.toHaveProperty("cleanupBundleMcpOnRunEnd");
+      expect(request.params).toHaveProperty("cleanupBundleMcpOnRunEnd", true);
       expect(agentCommand).not.toHaveBeenCalled();
       expect(agentModuleLoadCount).not.toHaveBeenCalled();
       expect(runtime.log).toHaveBeenCalledWith("hello");
@@ -370,6 +344,23 @@ describe("agentCliCommand", () => {
       expect(params.to).toBeUndefined();
       expect(request.config).toBe(loadConfig.mock.results[0]?.value);
       expect(loadConfig).toHaveBeenCalledWith();
+      expect(agentCommand).not.toHaveBeenCalled();
+      expect(loadAgentSessionModuleMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it("uses an agent-scoped --to value as the gateway session selector", async () => {
+    await withTempStore(async () => {
+      const sessionKey = "agent:main:openclaw-weixin:direct:o9cq802hhmfc@im.wechat";
+      mockGatewaySuccessReply();
+
+      await agentCliCommand({ message: "hi", to: sessionKey }, runtime);
+
+      expect(callGateway).toHaveBeenCalledTimes(1);
+      const request = requireRecord(requireFirstCallArg(callGateway, "gateway"), "gateway request");
+      const params = requireRecord(request.params, "gateway request params");
+      expect(params.sessionKey).toBe(sessionKey);
+      expect(params.to).toBeUndefined();
       expect(agentCommand).not.toHaveBeenCalled();
       expect(loadAgentSessionModuleMock).not.toHaveBeenCalled();
     });
@@ -1120,7 +1111,6 @@ describe("agentCliCommand", () => {
   it("passes SIGTERM abort signals into local agent runs", async () => {
     await withTempStore(async () => {
       const signals = createSignalProcess();
-      const abortListenerAttached = createDeferredVoid();
       agentCommand.mockImplementationOnce(async (opts: { abortSignal?: AbortSignal }) => {
         expect(opts.abortSignal).toBeInstanceOf(AbortSignal);
         return await new Promise((_, reject) => {
@@ -1133,7 +1123,6 @@ describe("agentCliCommand", () => {
             },
             { once: true },
           );
-          abortListenerAttached.resolve();
         });
       });
 
@@ -1141,7 +1130,6 @@ describe("agentCliCommand", () => {
         process: signals.processLike,
       });
       await waitForAgentCommandCall();
-      await abortListenerAttached.promise;
       signals.emit("SIGTERM");
 
       await run;
@@ -1155,7 +1143,6 @@ describe("agentCliCommand", () => {
   it("exits for local runs that resolve after SIGTERM aborts them", async () => {
     await withTempStore(async () => {
       const signals = createSignalProcess();
-      const abortListenerAttached = createDeferredVoid();
       agentCommand.mockImplementationOnce(async (opts: { abortSignal?: AbortSignal }) => {
         return await new Promise((resolve) => {
           opts.abortSignal?.addEventListener(
@@ -1168,7 +1155,6 @@ describe("agentCliCommand", () => {
             },
             { once: true },
           );
-          abortListenerAttached.resolve();
         });
       });
 
@@ -1176,7 +1162,6 @@ describe("agentCliCommand", () => {
         process: signals.processLike,
       });
       await waitForAgentCommandCall();
-      await abortListenerAttached.promise;
       signals.emit("SIGTERM");
 
       await expect(run).resolves.toBeUndefined();
@@ -1726,6 +1711,7 @@ describe("agentCliCommand", () => {
       );
       expect(localOpts.cleanupBundleMcpOnRunEnd).toBe(true);
       expect(localOpts.cleanupCliLiveSessionOnRunEnd).toBe(true);
+      expect(localOpts.oneShotCliRun).toBe(true);
       expect(localOpts).not.toHaveProperty("resultMetaOverrides");
       expect(runtime.log).toHaveBeenCalledWith("local");
     });
@@ -1821,6 +1807,7 @@ describe("agentCliCommand", () => {
       );
       expect(fallbackOpts.cleanupBundleMcpOnRunEnd).toBe(true);
       expect(fallbackOpts.cleanupCliLiveSessionOnRunEnd).toBe(true);
+      expect(fallbackOpts.oneShotCliRun).toBe(false);
     });
   });
 });
