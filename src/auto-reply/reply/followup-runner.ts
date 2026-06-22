@@ -13,6 +13,7 @@ import { resolveContextTokensForModel } from "../../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import { mergeEmbeddedAgentRunResultForModelFallbackExhaustion } from "../../agents/embedded-agent-runner/result-fallback-classifier.js";
 import { runEmbeddedAgent } from "../../agents/embedded-agent.js";
+import type { FastModeAutoProgressState } from "../../agents/fast-mode.js";
 import { ensureSelectedAgentHarnessPlugin } from "../../agents/harness/runtime-plugin.js";
 import { runWithModelFallback } from "../../agents/model-fallback.js";
 import { resolveCliRuntimeExecutionProvider } from "../../agents/model-runtime-aliases.js";
@@ -25,8 +26,8 @@ import {
   buildAgentRuntimeDeliveryPlan,
   buildAgentRuntimeOutcomePlan,
 } from "../../agents/runtime-plan/build.js";
-import { updateSessionStore, type SessionEntry } from "../../config/sessions.js";
-import { readSessionEntry } from "../../config/sessions/store-load.js";
+import type { SessionEntry } from "../../config/sessions.js";
+import { loadSessionEntry, updateSessionEntry } from "../../config/sessions/session-accessor.js";
 import type { TypingMode } from "../../config/types.js";
 import { logVerbose } from "../../globals.js";
 import {
@@ -67,6 +68,7 @@ import {
   resolveQueuedReplyExecutionConfig,
   resolveQueuedReplyRuntimeConfig,
   resolveModelFallbackOptions,
+  resolveRunFastModeForFallbackCandidate,
   resolveRunAuthProfile,
 } from "./agent-runner-utils.js";
 import {
@@ -157,7 +159,9 @@ async function forwardFollowupProgressEvent(params: {
 }) {
   const { evt, opts } = params;
   const emitChannelProgress = params.emitChannelProgress !== false;
-  if (!emitChannelProgress && evt.stream !== "compaction") {
+  const allowQuietToolLifecycle =
+    evt.stream === "tool" && opts?.allowToolLifecycleWhenProgressHidden === true;
+  if (!emitChannelProgress && evt.stream !== "compaction" && !allowQuietToolLifecycle) {
     return;
   }
 
@@ -529,7 +533,10 @@ export function createFollowupRunner(params: {
       const resolveCurrentVerboseLevel = () => {
         if (replySessionKey && storePath) {
           try {
-            const level = readSessionEntry(storePath, replySessionKey)?.verboseLevel;
+            const level = loadSessionEntry({
+              storePath,
+              sessionKey: replySessionKey,
+            })?.verboseLevel;
             if (typeof level === "string" && level.trim()) {
               return level;
             }
@@ -605,7 +612,10 @@ export function createFollowupRunner(params: {
         const admittedSessionEntry = replySessionKey
           ? (sessionStore?.[replySessionKey] ??
             (storePath
-              ? (readSessionEntry(storePath, replySessionKey) as SessionEntry | undefined)
+              ? loadSessionEntry({
+                  storePath,
+                  sessionKey: replySessionKey,
+                })
               : undefined))
           : undefined;
         if (admittedSessionEntry?.sessionId === replyOperation.sessionId) {
@@ -680,6 +690,8 @@ export function createFollowupRunner(params: {
           isControlUiVisible: shouldSurfaceToControlUi,
         });
       }
+      const prePreflightCompactionCount = activeSessionEntry?.compactionCount ?? 0;
+      let preflightCompactionApplied;
       try {
         activeSessionEntry = await runPreflightCompactionIfNeeded({
           cfg: runtimeConfig,
@@ -695,6 +707,8 @@ export function createFollowupRunner(params: {
           replyOperation,
           onCompactionNotice: notifyPreflightCompaction,
         });
+        preflightCompactionApplied =
+          (activeSessionEntry?.compactionCount ?? 0) > prePreflightCompactionCount;
       } catch (err) {
         clearAgentRunContext(runId, lifecycleGeneration);
         const message = formatErrorMessage(err);
@@ -790,16 +804,33 @@ export function createFollowupRunner(params: {
         if (!storePath) {
           return;
         }
-        await updateSessionStore(storePath, (store) => {
-          const persistedEntry = store[replySessionKey];
-          if (!persistedEntry) {
-            return;
-          }
+        await updateSessionEntry({ storePath, sessionKey: replySessionKey }, (persistedEntry) => {
           if (!entryMatchesAutoFallbackPrimaryProbe(persistedEntry, probe)) {
-            return;
+            return null;
           }
+          const shouldClearAuthProfile =
+            persistedEntry.authProfileOverrideSource === "auto" ||
+            (persistedEntry.authProfileOverrideSource === undefined &&
+              persistedEntry.authProfileOverrideCompactionCount !== undefined);
           clearAutoFallbackPrimaryProbeSelection(persistedEntry);
-          store[replySessionKey] = persistedEntry;
+          return {
+            providerOverride: undefined,
+            modelOverride: undefined,
+            modelOverrideSource: undefined,
+            modelOverrideFallbackOriginProvider: undefined,
+            modelOverrideFallbackOriginModel: undefined,
+            ...(shouldClearAuthProfile
+              ? {
+                  authProfileOverride: undefined,
+                  authProfileOverrideSource: undefined,
+                  authProfileOverrideCompactionCount: undefined,
+                }
+              : {}),
+            fallbackNoticeSelectedModel: undefined,
+            fallbackNoticeActiveModel: undefined,
+            fallbackNoticeReason: undefined,
+            updatedAt: persistedEntry.updatedAt,
+          };
         });
       };
       fallbackProvider = run.provider;
@@ -815,6 +846,11 @@ export function createFollowupRunner(params: {
         | undefined;
       let queuedUserMessagePersistedAcrossFallback = false;
       let assistantErrorPersistedAcrossFallback = false;
+      const fastModeStartedAtMs = Date.now();
+      const fastModeAutoProgressState: FastModeAutoProgressState = {
+        offAnnounced: false,
+        resetAnnounced: false,
+      };
       try {
         const outcomePlan = buildAgentRuntimeOutcomePlan();
         const fallbackResult = await runWithModelFallback<EmbeddedAgentRunResult>({
@@ -850,6 +886,13 @@ export function createFollowupRunner(params: {
             const suppressAssistantErrorPersistenceForCandidate =
               assistantErrorPersistedAcrossFallback;
             const candidateRun = resolveRunForFallbackCandidate(provider, model);
+            const candidateFastMode = resolveRunFastModeForFallbackCandidate({
+              run: candidateRun,
+              config: runtimeConfig,
+              provider,
+              model,
+              sessionEntry: activeSessionEntry,
+            });
             const activeProbe = run.autoFallbackPrimaryProbe;
             if (activeProbe && provider === activeProbe.provider && model === activeProbe.model) {
               markAutoFallbackPrimaryProbe({
@@ -966,6 +1009,19 @@ export function createFollowupRunner(params: {
                           });
                         }
                       : undefined,
+                  onFastModeAutoProgress: async (payload) => {
+                    await enqueueProgressDelivery(async () => {
+                      await sendFollowupPayloads(
+                        [payload],
+                        effectiveQueued,
+                        {
+                          provider,
+                          modelId: model,
+                        },
+                        { kind: "tool", mirror: false, runId },
+                      );
+                    });
+                  },
                   transformResult:
                     queued.currentInboundEventKind === "room_event"
                       ? (resultLocal) =>
@@ -1006,6 +1062,11 @@ export function createFollowupRunner(params: {
                       config: runtimeConfig,
                     }),
                     thinkLevel: run.thinkLevel,
+                    fastMode: candidateFastMode.fastMode,
+                    fastModeStartedAtMs,
+                    fastModeAutoOnSeconds: candidateFastMode.fastModeAutoOnSeconds,
+                    fastModeAutoProgressState,
+                    isFinalFallbackAttempt: runOptions?.isFinalFallbackAttempt,
                     timeoutMs: run.timeoutMs,
                     runTimeoutOverrideMs: run.runTimeoutOverrideMs,
                     runId,
@@ -1124,6 +1185,10 @@ export function createFollowupRunner(params: {
                 model,
                 ...selectedAuthProfile,
                 thinkLevel: run.thinkLevel,
+                fastMode: candidateFastMode.fastMode,
+                fastModeStartedAtMs,
+                fastModeAutoOnSeconds: candidateFastMode.fastModeAutoOnSeconds,
+                fastModeAutoProgressState,
                 verboseLevel: run.verboseLevel,
                 reasoningLevel: run.reasoningLevel,
                 suppressToolErrorWarnings: shouldSuppressToolErrorWarnings,
@@ -1306,6 +1371,7 @@ export function createFollowupRunner(params: {
           cliSessionBinding: runResult.meta?.agentMeta?.cliSessionBinding,
           clearCliSessionBinding:
             usedCliProvider && runResult.meta?.agentMeta?.clearCliSessionBinding === true,
+          preserveFreshTotalTokensOnStaleUsage: preflightCompactionApplied,
           logLabel: "followup",
         });
       }
