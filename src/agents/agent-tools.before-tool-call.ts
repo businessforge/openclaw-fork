@@ -16,6 +16,7 @@ import {
 import {
   emitTrustedDiagnosticEvent,
   emitTrustedDiagnosticEventWithPrivateData,
+  emitTrustedSkillUsedDiagnosticEvent,
   emitTrustedSecurityEvent,
   type DiagnosticEventPrivateData,
   type DiagnosticToolParamsSummary,
@@ -39,6 +40,7 @@ import {
   describeNativePluginApprovalClientSetup,
   resolveApprovalInitiatingSurfaceState,
 } from "../infra/exec-approval-surface.js";
+import { resolveCanonicalPluginApprovalRequestAllowedDecisions } from "../infra/plugin-approval-canonical-decisions.js";
 import {
   DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS,
   MAX_PLUGIN_APPROVAL_TIMEOUT_MS,
@@ -67,7 +69,7 @@ import {
   resolveSkillTelemetrySource,
   resolveSkillTelemetrySourceValue,
 } from "../skills/loading/source.js";
-import type { SkillSnapshot, SkillTelemetrySource } from "../skills/types.js";
+import type { SkillSnapshot, SkillTelemetrySource, SkillUsagePath } from "../skills/types.js";
 import { resolveSkillWorkshopToolApproval } from "../skills/workshop/policy.js";
 import { isPlainObject, truncateUtf16Safe } from "../utils.js";
 import {
@@ -77,6 +79,7 @@ import {
   recordStructuredReplaySafeToolCall,
   structuredReplaySafeToolCallIds,
 } from "./agent-tools.before-tool-call.state.js";
+import { normalizeFileToolPathParam } from "./agent-tools.params.js";
 import { resolveAgentRunAbortLifecycleFields } from "./run-termination.js";
 export {
   consumeAdjustedParamsForToolCall,
@@ -114,6 +117,7 @@ import { copyToolTerminalPresentation } from "./tool-terminal-presentation.js";
 import { getToolTerminalPresentation } from "./tool-terminal-presentation.js";
 import type { AnyAgentTool } from "./tools/common.js";
 import { callGatewayTool } from "./tools/gateway.js";
+import { canonicalizePath } from "./utils/paths.js";
 
 export type ToolOutcomeObservation = {
   toolName: string;
@@ -151,8 +155,10 @@ export type HookContext = {
   onToolOutcome?: ToolOutcomeObserver;
   allocateToolOutcomeOrdinal?: (toolCallId?: string) => number;
   skillsSnapshot?: SkillSnapshot;
+  skillUsagePaths?: SkillUsagePath[];
   skillCommand?: {
     commandName: string;
+    skillFile?: string;
     skillName: string;
     skillSource?: SkillTelemetrySource;
     toolName?: string;
@@ -263,7 +269,7 @@ const pendingTerminalPresentationByToolCall = new Map<
   }
 >();
 
-export function resolveToolTerminalPresentation(params: {
+function resolveToolTerminalPresentation(params: {
   tool: AnyAgentTool;
   toolParams: unknown;
   result: Awaited<ReturnType<AnyAgentTool["execute"]>>;
@@ -586,15 +592,55 @@ function resolveToolDiagnosticIdentity(tool: AnyAgentTool): ToolDiagnosticIdenti
 }
 
 type SkillUsageMatch = {
+  skillFile?: string;
   skillName: string;
   skillSource: SkillTelemetrySource;
   activation: "command" | "read";
 };
 
+function canonicalSkillFile(value: string | undefined): string | undefined {
+  const skillFile = value?.trim();
+  return skillFile && path.isAbsolute(skillFile)
+    ? canonicalizePath(path.resolve(skillFile))
+    : undefined;
+}
+
+function resolvedSkillUsageMatch(params: {
+  activation: SkillUsageMatch["activation"];
+  skill: NonNullable<SkillSnapshot["resolvedSkills"]>[number];
+}): SkillUsageMatch {
+  const skillFile = canonicalSkillFile(params.skill.filePath);
+  return {
+    skillName: params.skill.name.trim(),
+    skillSource: resolveSkillTelemetrySource(params.skill),
+    activation: params.activation,
+    ...(skillFile ? { skillFile } : {}),
+  };
+}
+
+function findResolvedSkillUsageMatch(params: {
+  activation: SkillUsageMatch["activation"];
+  skillName: string;
+  skillSource: SkillTelemetrySource;
+  snapshot?: SkillSnapshot;
+}): SkillUsageMatch | undefined {
+  const skillName = params.skillName.trim();
+  const candidates = (params.snapshot?.resolvedSkills ?? []).filter(
+    (skill) => skill.name.trim() === skillName,
+  );
+  const skill =
+    candidates.find((candidate) => resolveSkillTelemetrySource(candidate) === params.skillSource) ??
+    (candidates.length === 1 ? candidates[0] : undefined);
+  return skill ? resolvedSkillUsageMatch({ activation: params.activation, skill }) : undefined;
+}
+
 function resolveRelativeToolPath(candidate: string, ctx?: HookContext): string | undefined {
   const trimmed = candidate.trim();
   if (!trimmed) {
     return undefined;
+  }
+  if (trimmed.startsWith("node://")) {
+    return trimmed;
   }
   if (trimmed === "~") {
     return os.homedir();
@@ -615,7 +661,7 @@ function readToolPathCandidates(params: unknown, ctx?: HookContext): string[] {
   }
   const candidates = typeof params.path === "string" ? [params.path] : [];
   return candidates
-    .map((candidate) => resolveRelativeToolPath(candidate, ctx))
+    .map((candidate) => resolveRelativeToolPath(normalizeFileToolPathParam(candidate), ctx))
     .filter((candidate): candidate is string => Boolean(candidate));
 }
 
@@ -626,19 +672,32 @@ function skillInstructionPaths(snapshot: SkillSnapshot | undefined): Map<string,
     if (!skillName) {
       continue;
     }
-    const match = {
-      skillName,
-      skillSource: resolveSkillTelemetrySource(skill),
-      activation: "read" as const,
-    };
+    const match = resolvedSkillUsageMatch({ activation: "read", skill });
     const filePath = typeof skill.filePath === "string" ? skill.filePath.trim() : "";
-    if (filePath && path.isAbsolute(filePath)) {
-      matches.set(path.resolve(filePath), match);
+    if (filePath) {
+      if (filePath.startsWith("node://")) {
+        matches.set(filePath, match);
+      } else if (path.isAbsolute(filePath)) {
+        matches.set(path.resolve(filePath), match);
+      }
     }
     const baseDir = typeof skill.baseDir === "string" ? skill.baseDir.trim() : "";
     if (baseDir && path.isAbsolute(baseDir)) {
       matches.set(path.resolve(baseDir, "SKILL.md"), match);
     }
+  }
+  return matches;
+}
+
+function materializedSkillInstructionPaths(paths: SkillUsagePath[] | undefined) {
+  const matches = new Map<string, SkillUsageMatch>();
+  for (const entry of paths ?? []) {
+    matches.set(path.resolve(entry.readPath), {
+      skillFile: entry.skillFile,
+      skillName: entry.skillName,
+      skillSource: entry.skillSource,
+      activation: "read",
+    });
   }
   return matches;
 }
@@ -652,18 +711,29 @@ function findSkillUsageMatch(params: {
   if (command) {
     const commandToolName = normalizeToolName(command.toolName ?? params.toolName);
     if (!commandToolName || commandToolName === params.toolName) {
+      const skillSource = resolveSkillTelemetrySourceValue(command.skillSource);
+      const snapshotMatch = findResolvedSkillUsageMatch({
+        activation: "command",
+        skillName: command.skillName,
+        skillSource,
+        snapshot: params.ctx?.skillsSnapshot,
+      });
+      const skillFile = canonicalSkillFile(command.skillFile) ?? snapshotMatch?.skillFile;
       return {
         skillName: command.skillName,
-        skillSource: resolveSkillTelemetrySourceValue(command.skillSource),
+        skillSource,
         activation: "command",
+        ...(skillFile ? { skillFile } : {}),
       };
     }
   }
 
-  if (params.toolName !== "read" || !params.ctx?.skillsSnapshot?.resolvedSkills?.length) {
+  if (params.toolName !== "read") {
     return undefined;
   }
-  const skillPaths = skillInstructionPaths(params.ctx.skillsSnapshot);
+  const skillPaths = params.ctx?.skillsSnapshot?.resolvedSkills?.length
+    ? skillInstructionPaths(params.ctx.skillsSnapshot)
+    : materializedSkillInstructionPaths(params.ctx?.skillUsagePaths);
   for (const candidate of readToolPathCandidates(params.toolParams, params.ctx)) {
     const match = skillPaths.get(candidate);
     if (match) {
@@ -682,19 +752,24 @@ function emitSkillUsedDiagnostic(params: {
   const trace = params.ctx?.trace
     ? freezeDiagnosticTraceContext(createChildDiagnosticTraceContext(params.ctx.trace))
     : undefined;
-  emitTrustedDiagnosticEvent({
-    type: "skill.used",
-    ...(params.ctx?.runId && { runId: params.ctx.runId }),
-    ...(params.ctx?.sessionKey && { sessionKey: params.ctx.sessionKey }),
-    ...(params.ctx?.sessionId && { sessionId: params.ctx.sessionId }),
-    ...(params.ctx?.agentId && { agentId: params.ctx.agentId }),
-    ...(trace && { trace }),
-    skillName: params.match.skillName,
-    skillSource: params.match.skillSource,
-    activation: params.match.activation,
-    toolName: params.toolName,
-    ...(params.toolCallId && { toolCallId: params.toolCallId }),
-  });
+  // Skill file paths are trusted-internal accounting data. Public diagnostic
+  // payloads stay path-free even when diagnostics are enabled.
+  emitTrustedSkillUsedDiagnosticEvent(
+    {
+      type: "skill.used",
+      ...(params.ctx?.runId && { runId: params.ctx.runId }),
+      ...(params.ctx?.sessionKey && { sessionKey: params.ctx.sessionKey }),
+      ...(params.ctx?.sessionId && { sessionId: params.ctx.sessionId }),
+      ...(params.ctx?.agentId && { agentId: params.ctx.agentId }),
+      ...(trace && { trace }),
+      skillName: params.match.skillName,
+      skillSource: params.match.skillSource,
+      activation: params.match.activation,
+      toolName: params.toolName,
+      ...(params.toolCallId && { toolCallId: params.toolCallId }),
+    },
+    params.match.skillFile ? { skillUsage: { skillFile: params.match.skillFile } } : undefined,
+  );
 }
 
 function emitToolBlockedSecurityEvent(params: {
@@ -754,6 +829,24 @@ function emitToolBlockedSecurityEvent(params: {
   });
 }
 
+// Once-per-plugin-per-process deprecation signal; the field is ignored at
+// runtime because unresolved approvals always fail closed on timeout.
+const warnedDeprecatedTimeoutBehaviorPluginIds = new Set<string>();
+
+function warnDeprecatedApprovalTimeoutBehavior(approval: PluginApprovalRequest): void {
+  if (approval.timeoutBehavior !== "allow") {
+    return;
+  }
+  const pluginId = approval.pluginId ?? "unknown-plugin";
+  if (warnedDeprecatedTimeoutBehaviorPluginIds.has(pluginId)) {
+    return;
+  }
+  warnedDeprecatedTimeoutBehaviorPluginIds.add(pluginId);
+  log.warn(
+    `plugin '${pluginId}' sets deprecated requireApproval.timeoutBehavior:"allow"; the field is ignored and approvals fail closed on timeout (see docs/plugins/plugin-permission-requests.md)`,
+  );
+}
+
 function notifyPluginApprovalResolution(
   approval: PluginApprovalRequest,
   resolution: PluginApprovalResolution,
@@ -769,6 +862,21 @@ function notifyPluginApprovalResolution(
   } catch (err) {
     log.warn(`plugin onResolution callback failed: ${String(err)}`);
   }
+}
+
+function resolvePermittedPluginApprovalResolution(
+  decision: unknown,
+  allowedDecisions: readonly string[],
+): PluginApprovalResolution {
+  if (
+    (decision === PluginApprovalResolutions.ALLOW_ONCE ||
+      decision === PluginApprovalResolutions.ALLOW_ALWAYS ||
+      decision === PluginApprovalResolutions.DENY) &&
+    allowedDecisions.includes(decision)
+  ) {
+    return decision;
+  }
+  return PluginApprovalResolutions.TIMEOUT;
 }
 
 function buildPluginApprovalFailureReason(params: {
@@ -820,6 +928,7 @@ async function requestPluginToolApproval(params: {
   const approval = params.approval;
   const timeoutMs = resolvePluginToolApprovalTimeoutMs(approval);
   const gatewayTimeoutMs = resolvePluginToolApprovalGatewayTimeoutMs(timeoutMs);
+  const allowedDecisions = resolveCanonicalPluginApprovalRequestAllowedDecisions(approval);
   let gatewayApprovalPhase: "none" | "request" | "wait" = "none";
   try {
     const embeddedApprovalBroker = isEmbeddedMode() ? getEmbeddedPluginApprovalBroker() : null;
@@ -844,16 +953,11 @@ async function requestPluginToolApproval(params: {
         signal: params.signal,
       });
       const decision = result.decision;
-      const resolution: PluginApprovalResolution =
-        decision === PluginApprovalResolutions.ALLOW_ONCE ||
-        decision === PluginApprovalResolutions.ALLOW_ALWAYS ||
-        decision === PluginApprovalResolutions.DENY
-          ? decision
-          : PluginApprovalResolutions.TIMEOUT;
+      const resolution = resolvePermittedPluginApprovalResolution(decision, allowedDecisions);
       notifyPluginApprovalResolution(approval, resolution);
       if (
-        decision === PluginApprovalResolutions.ALLOW_ONCE ||
-        decision === PluginApprovalResolutions.ALLOW_ALWAYS
+        resolution === PluginApprovalResolutions.ALLOW_ONCE ||
+        resolution === PluginApprovalResolutions.ALLOW_ALWAYS
       ) {
         return {
           blocked: false,
@@ -861,7 +965,7 @@ async function requestPluginToolApproval(params: {
           approvalResolution: resolution,
         };
       }
-      if (decision === PluginApprovalResolutions.DENY) {
+      if (resolution === PluginApprovalResolutions.DENY) {
         return {
           blocked: true,
           kind: "failure",
@@ -869,13 +973,6 @@ async function requestPluginToolApproval(params: {
           deniedReason: "plugin-approval",
           reason: "Denied by user",
           params: params.baseParams,
-        };
-      }
-      if (approval.timeoutBehavior === "allow") {
-        return {
-          blocked: false,
-          params: mergeParamsWithApprovalOverrides(params.baseParams, params.overrideParams),
-          approvalResolution: resolution,
         };
       }
       // Veto carries the plugin-supplied reason; plain timeouts record a
@@ -902,7 +999,7 @@ async function requestPluginToolApproval(params: {
     const requestResult: {
       id?: string;
       status?: string;
-      decision?: string | null;
+      decision?: unknown;
       deliveryRoute?: string;
     } = await callGatewayTool(
       "plugin.approval.request",
@@ -945,7 +1042,7 @@ async function requestPluginToolApproval(params: {
       };
     }
     const hasImmediateDecision = Object.hasOwn(requestResult ?? {}, "decision");
-    let decision: string | null | undefined;
+    let decision: unknown;
     if (hasImmediateDecision) {
       decision = requestResult?.decision;
       if (decision === null) {
@@ -968,7 +1065,7 @@ async function requestPluginToolApproval(params: {
       gatewayApprovalPhase = "wait";
       const waitPromise: Promise<{
         id?: string;
-        decision?: string | null;
+        decision?: unknown;
       }> = callGatewayTool(
         "plugin.approval.waitDecision",
         // Buffer beyond the approval timeout so the gateway can clean up
@@ -976,7 +1073,7 @@ async function requestPluginToolApproval(params: {
         { timeoutMs: gatewayTimeoutMs },
         { id },
       );
-      let waitResult: { id?: string; decision?: string | null } | undefined;
+      let waitResult: { id?: string; decision?: unknown } | undefined;
       if (params.signal) {
         let onAbort: (() => void) | undefined;
         const abortPromise = new Promise<never>((_, reject) => {
@@ -997,18 +1094,15 @@ async function requestPluginToolApproval(params: {
       } else {
         waitResult = await waitPromise;
       }
-      decision = waitResult?.decision;
+      // Bind the verdict to the request that parked this call. A stale or
+      // misrouted reply must never release a different tool gate.
+      decision = waitResult?.id === id ? waitResult.decision : undefined;
     }
-    const resolution: PluginApprovalResolution =
-      decision === PluginApprovalResolutions.ALLOW_ONCE ||
-      decision === PluginApprovalResolutions.ALLOW_ALWAYS ||
-      decision === PluginApprovalResolutions.DENY
-        ? decision
-        : PluginApprovalResolutions.TIMEOUT;
+    const resolution = resolvePermittedPluginApprovalResolution(decision, allowedDecisions);
     notifyPluginApprovalResolution(approval, resolution);
     if (
-      decision === PluginApprovalResolutions.ALLOW_ONCE ||
-      decision === PluginApprovalResolutions.ALLOW_ALWAYS
+      resolution === PluginApprovalResolutions.ALLOW_ONCE ||
+      resolution === PluginApprovalResolutions.ALLOW_ALWAYS
     ) {
       return {
         blocked: false,
@@ -1016,7 +1110,7 @@ async function requestPluginToolApproval(params: {
         approvalResolution: resolution,
       };
     }
-    if (decision === PluginApprovalResolutions.DENY) {
+    if (resolution === PluginApprovalResolutions.DENY) {
       return {
         blocked: true,
         kind: "failure",
@@ -1024,14 +1118,6 @@ async function requestPluginToolApproval(params: {
         deniedReason: "plugin-approval",
         reason: "Denied by user",
         params: params.baseParams,
-      };
-    }
-    const timeoutBehavior = approval.timeoutBehavior ?? "deny";
-    if (timeoutBehavior === "allow") {
-      return {
-        blocked: false,
-        params: mergeParamsWithApprovalOverrides(params.baseParams, params.overrideParams),
-        approvalResolution: resolution,
       };
     }
     const fallbackTimeoutReason = approval.timeoutReason ?? "Approval timed out";
@@ -1127,6 +1213,7 @@ async function resolveBeforeToolCallApprovalOutcome(params: {
   if (!approval) {
     return undefined;
   }
+  warnDeprecatedApprovalTimeoutBehavior(approval);
   if (params.approvalMode === "defer") {
     return {
       blocked: false,
@@ -1981,7 +2068,6 @@ export const testing = {
   mergeParamsWithApprovalOverrides,
   isPlainObject,
 };
-export { testing as __testing };
 
 function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
   if (value instanceof Error) {
