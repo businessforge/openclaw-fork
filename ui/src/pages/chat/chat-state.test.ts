@@ -1,11 +1,13 @@
 import type { ReactiveController, ReactiveControllerHost } from "lit";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { SLASH_COMMANDS } from "../../lib/chat/commands.ts";
-import { createStorageMock } from "../../test-helpers/storage.ts";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as assistantIdentity from "../../app/assistant-identity.ts";
 import {
-  applyRemoteSlashCommandsResult,
-  resetChatSlashCommandMetadataForTest,
-} from "./chat-commands.ts";
+  buildFallbackSlashCommands,
+  replaceSlashCommands,
+  SLASH_COMMANDS,
+} from "../../lib/chat/commands.ts";
+import { createStorageMock } from "../../test-helpers/storage.ts";
+import { applyRemoteSlashCommandsResult } from "./chat-commands.ts";
 import {
   admitQueuedMessageForSession,
   removeQueuedMessage,
@@ -16,7 +18,6 @@ import {
   ChatStateController,
   handlePageGatewayEvent,
   refreshChatMetadata,
-  requestChatPageUpdate,
   resetChatStateForRouteSession,
   retryChatComposerMemoryFallback,
   resolveChatAvatarUrl,
@@ -35,18 +36,83 @@ import {
 } from "./composer-persistence.ts";
 import { scheduleControlUiAfterPaint } from "./performance.ts";
 
-vi.mock("../../app/assistant-identity.ts", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../app/assistant-identity.ts")>()),
-  loadLocalAssistantIdentity: () => ({ avatar: "data:image/png;base64,bG9jYWw=" }),
-}));
+beforeEach(() => {
+  vi.spyOn(assistantIdentity, "loadLocalAssistantIdentity").mockReturnValue({
+    avatar: "data:image/png;base64,bG9jYWw=",
+  });
+});
 
 afterEach(() => {
-  resetChatSlashCommandMetadataForTest();
+  replaceSlashCommands(buildFallbackSlashCommands());
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
 describe("ChatStateController render lifecycle", () => {
+  it("tracks waiting approval only for the selected session until resolution", () => {
+    const state = {
+      sessionKey: "agent:main:current",
+      assistantAgentId: "main",
+      agentsList: { defaultId: "main" },
+      chatRunId: "client-run-1",
+      chatStream: null,
+      chatStreamStartedAt: 1,
+      chatStreamSegments: [],
+      chatToolMessages: [],
+      toolStreamById: new Map(),
+      toolStreamOrder: [],
+      toolStreamSyncTimer: null,
+      waitingApprovalStatuses: new Map(),
+      sessions: { setModelOverride: vi.fn() },
+      chatStreamRenderFrame: null,
+      requestUpdate: vi.fn(),
+    } as unknown as ChatPageHost;
+    const lifecycleEvent = (
+      phase: "waiting-approval" | "approval-resolved",
+      sessionKey: string,
+      approvalId = "approval-1",
+    ) =>
+      ({
+        type: "event" as const,
+        event: "agent",
+        payload: {
+          runId: "engine-run-1",
+          seq: 1,
+          stream: "lifecycle",
+          ts: Date.now(),
+          sessionKey,
+          agentId: "main",
+          data: { phase, approvalId, toolCallId: `tool-${approvalId}` },
+        },
+      }) satisfies Parameters<typeof handlePageGatewayEvent>[1];
+
+    handlePageGatewayEvent(state, lifecycleEvent("waiting-approval", "agent:main:other"));
+    expect(state.waitingApprovalStatuses.size).toBe(0);
+
+    handlePageGatewayEvent(state, lifecycleEvent("waiting-approval", state.sessionKey));
+    expect(state.waitingApprovalStatuses.get("approval-1")).toEqual({
+      approvalId: "approval-1",
+      toolCallId: "tool-approval-1",
+      runId: "engine-run-1",
+    });
+
+    handlePageGatewayEvent(state, lifecycleEvent("approval-resolved", "agent:main:other"));
+    expect(state.waitingApprovalStatuses.has("approval-1")).toBe(true);
+
+    handlePageGatewayEvent(
+      state,
+      lifecycleEvent("waiting-approval", state.sessionKey, "approval-2"),
+    );
+    handlePageGatewayEvent(state, lifecycleEvent("approval-resolved", state.sessionKey));
+    expect([...state.waitingApprovalStatuses.keys()]).toEqual(["approval-2"]);
+
+    handlePageGatewayEvent(
+      state,
+      lifecycleEvent("approval-resolved", state.sessionKey, "approval-2"),
+    );
+    expect(state.waitingApprovalStatuses.size).toBe(0);
+  });
+
   it("coalesces stream invalidations into one animation frame", () => {
     let nextFrame = 1;
     const frames = new Map<number, FrameRequestCallback>();
@@ -59,11 +125,26 @@ describe("ChatStateController render lifecycle", () => {
       frames.delete(id);
     });
     const requestUpdate = vi.fn();
-    const state = { chatStreamRenderFrame: null, requestUpdate };
+    const state = {
+      chatMessages: [],
+      chatMessagesBySession: new Map(),
+      chatRunId: "run-1",
+      chatStream: null,
+      chatStreamRenderFrame: null,
+      chatStreamStartedAt: 1,
+      lastError: null,
+      pendingSessionMessageReloadSessionKey: null,
+      requestUpdate,
+      sessionKey: "main",
+    } as unknown as ChatPageHost;
 
-    requestChatPageUpdate(state, "animation-frame");
-    requestChatPageUpdate(state, "animation-frame");
-    requestChatPageUpdate(state, "animation-frame");
+    for (const deltaText of ["A", "B", "C"]) {
+      handlePageGatewayEvent(state, {
+        type: "event",
+        event: "chat",
+        payload: { state: "delta", runId: "run-1", sessionKey: "main", deltaText },
+      });
+    }
 
     expect(frames.size).toBe(1);
     expect(requestUpdate).not.toHaveBeenCalled();
@@ -73,9 +154,17 @@ describe("ChatStateController render lifecycle", () => {
     expect(requestUpdate).toHaveBeenCalledOnce();
     expect(state.chatStreamRenderFrame).toBeNull();
 
-    requestChatPageUpdate(state, "animation-frame");
+    handlePageGatewayEvent(state, {
+      type: "event",
+      event: "chat",
+      payload: { state: "delta", runId: "run-1", sessionKey: "main", deltaText: "D" },
+    });
     const staleFrame = frames.get(2);
-    requestChatPageUpdate(state);
+    handlePageGatewayEvent(state, {
+      type: "event",
+      event: "session.operation",
+      payload: {},
+    });
     staleFrame?.(0);
 
     expect(cancelFrame).toHaveBeenCalledWith(2);
@@ -105,6 +194,7 @@ describe("ChatStateController render lifecycle", () => {
 
     for (const deltaText of ["A", "B", "C"]) {
       handlePageGatewayEvent(state, {
+        type: "event",
         event: "chat",
         payload: { state: "delta", runId: "run-1", sessionKey: "main", deltaText },
       });
@@ -293,6 +383,29 @@ describe("route composer fallback", () => {
     } as unknown as ChatPageHost;
     return { resetChatInputHistoryNavigation, resetChatScroll, state };
   }
+
+  it("restores one atomic history snapshot when returning to a session", () => {
+    vi.stubGlobal("sessionStorage", createStorageMock());
+    const { state } = createRouteState("");
+    state.chatMessages = [{ role: "assistant", content: "first session" }];
+    state.chatHistoryPagination = { hasMore: true, nextOffset: 400, totalMessages: 718 };
+    state.currentSessionId = "session-first";
+
+    resetChatStateForRouteSession(state, "agent:main:second");
+    state.chatMessages = [{ role: "assistant", content: "second session" }];
+    state.chatHistoryPagination = { hasMore: false, totalMessages: 1 };
+    state.currentSessionId = "session-second";
+
+    resetChatStateForRouteSession(state, "agent:main:first");
+
+    expect(state.chatMessages).toEqual([{ role: "assistant", content: "first session" }]);
+    expect(state.chatHistoryPagination).toEqual({
+      hasMore: true,
+      nextOffset: 400,
+      totalMessages: 718,
+    });
+    expect(state.currentSessionId).toBe("session-first");
+  });
 
   it("reapplies a live send projection when a subscribed pane switches into its scope", () => {
     vi.stubGlobal("sessionStorage", createStorageMock());
@@ -1321,3 +1434,4 @@ describe("refreshChatMetadata", () => {
     expect(SLASH_COMMANDS.some((command) => command.name === "work-command")).toBe(false);
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
