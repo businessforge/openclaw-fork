@@ -72,6 +72,7 @@ const TRANSIENT_WORKSPACE_READ_ERRNOS = new Set([-11, -4]);
 const TRANSIENT_WORKSPACE_READ_MESSAGE = /Unknown system error -(?:11|4)\b/i;
 
 const workspaceTemplateCache = new Map<string, Promise<string>>();
+// Git availability is process-stable; cache the probe result, including failure, until restart.
 let gitAvailabilityPromise: Promise<boolean> | null = null;
 
 // File content cache keyed by stable file identity to avoid stale reads.
@@ -235,6 +236,15 @@ const OPTIONAL_BOOTSTRAP_FILENAMES: ReadonlySet<string> = new Set([
   DEFAULT_IDENTITY_FILENAME,
   DEFAULT_USER_FILENAME,
 ]);
+
+/**
+ * Bootstrap files whose absence is a normal workspace state rather than a fault:
+ * the optional profile files, plus MEMORY.md which only appears once memory is
+ * written. Editors should offer these for creation instead of flagging them.
+ */
+export function isExpectedAbsentBootstrapFile(name: string): boolean {
+  return OPTIONAL_BOOTSTRAP_FILENAMES.has(name) || name === DEFAULT_MEMORY_FILENAME;
+}
 
 export const WORKSPACE_VANISHED_ERROR_CODE = "WORKSPACE_VANISHED";
 
@@ -969,8 +979,8 @@ export async function loadWorkspaceBootstrapFiles(dir: string): Promise<Workspac
   const result: WorkspaceBootstrapFile[] = [];
   for (const entry of entries) {
     if (
-      entry.name === DEFAULT_MEMORY_FILENAME &&
-      !(await exactWorkspaceEntryExists(resolvedDir, DEFAULT_MEMORY_FILENAME))
+      (entry.name === DEFAULT_MEMORY_FILENAME || entry.name === DEFAULT_USER_FILENAME) &&
+      !(await exactWorkspaceEntryExists(resolvedDir, entry.name))
     ) {
       continue;
     }
