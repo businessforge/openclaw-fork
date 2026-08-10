@@ -18,12 +18,17 @@ import {
 } from "../infra/agent-events.js";
 import { jsonUtf8Bytes } from "../infra/json-utf8-bytes.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
+import { notifyChatAbortControllerRemoved } from "./chat-abort-lifecycle-internal.js";
 import { projectLiveAssistantBufferedText } from "./live-chat-projector.js";
 import {
   createChatAbortMarker,
   type ChatRunPlanSnapshot,
   type ChatRunState,
 } from "./server-chat-state.js";
+import {
+  resolveSessionSubscriptionKey,
+  resolveSessionSubscriptionKeys,
+} from "./session-subscription-keys.js";
 
 const DEFAULT_CHAT_RUN_ABORT_GRACE_MS = 60_000;
 
@@ -89,6 +94,7 @@ export type RestartRecoveryCandidate = {
 type InFlightRunSnapshot = {
   runId: string;
   text: string;
+  startedAt?: number;
   plan?: ChatRunPlanSnapshot;
   events?: AgentEventPayload[];
 };
@@ -371,6 +377,7 @@ export function resolveInFlightRunSnapshot(params: {
   return {
     runId: best.runId,
     text: projected.suppress ? "" : projected.text,
+    startedAt: best.startedAtMs,
     ...(plan ? { plan } : {}),
     ...(events?.length ? { events } : {}),
   };
@@ -389,15 +396,22 @@ export function boundInFlightRunSnapshotForChatHistory(params: {
   if (messagesBytes + snapshotBytes <= params.maxBytes) {
     return params.snapshot;
   }
-  // Recovery priority is run adoption, then active progress, plan replay, and
-  // opportunistic text. Explicit empty projections authoritatively clear any
-  // stale client state when a richer snapshot cannot fit the history budget.
+  // Recovery priority is run adoption, authoritative timing, active progress,
+  // plan replay, and opportunistic text. Explicit empty projections
+  // authoritatively clear stale client state when a richer snapshot cannot fit.
   let bounded: InFlightRunSnapshot = {
     runId: params.snapshot.runId,
     text: "",
     ...(params.snapshot.events ? { events: [] } : {}),
     ...(params.snapshot.plan ? { plan: { steps: [] } } : {}),
   };
+
+  if (params.snapshot.startedAt !== undefined) {
+    const candidate = { ...bounded, startedAt: params.snapshot.startedAt };
+    if (messagesBytes + jsonUtf8Bytes(candidate) <= params.maxBytes) {
+      bounded = candidate;
+    }
+  }
 
   if (params.snapshot.events) {
     const events = [...params.snapshot.events];
@@ -467,20 +481,19 @@ function resolveChatAbortDeliverySessionKeys(
   sessionKey: string,
   agentId: string | undefined,
 ): string[] {
-  if (sessionKey !== "global") {
-    return [sessionKey];
-  }
   const scopedAgentId = normalizeActiveAgentId(agentId);
   if (!scopedAgentId) {
     return [sessionKey];
   }
-  const keys = [`agent:${scopedAgentId}:global`];
-  const cfg = ops.getRuntimeConfig?.();
-  const defaultAgentId = cfg ? resolveDefaultAgentId(cfg) : undefined;
-  if (defaultAgentId && scopedAgentId === defaultAgentId) {
-    keys.push(sessionKey);
+  const canonicalKey = resolveSessionSubscriptionKey(sessionKey, scopedAgentId);
+  if (canonicalKey === sessionKey) {
+    return [canonicalKey];
   }
-  return keys;
+  return resolveSessionSubscriptionKeys(
+    sessionKey,
+    scopedAgentId,
+    resolveDefaultGlobalAgentId(ops),
+  );
 }
 
 function broadcastChatAborted(
@@ -555,6 +568,8 @@ export function removeChatAbortControllerEntry(
     entry.onRemoved?.();
   } catch {
     // Removal owns state cleanup even if a caller-provided release hook fails.
+  } finally {
+    notifyChatAbortControllerRemoved(entry);
   }
   return true;
 }

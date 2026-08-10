@@ -315,12 +315,14 @@ export const AgentParamsSchema = closedObject({
   bootstrapContextMode: Type.Optional(
     Type.Union([Type.Literal("full"), Type.Literal("lightweight")]),
   ),
-  // Commitment fan-out scope is scheduler-internal and cannot be selected over Gateway RPC.
   bootstrapContextRunKind: Type.Optional(
     Type.Union([Type.Literal("default"), Type.Literal("heartbeat"), Type.Literal("cron")]),
   ),
   acpTurnSource: Type.Optional(Type.Literal("manual_spawn")),
   internalRuntimeHandoffId: Type.Optional(NonEmptyString),
+  // Enabled backend recovery supplies only capture/retry mode. Disabled collection omits it;
+  // the private token, when present, remains in durable session state.
+  internalExecutionIdentityRetry: Type.Optional(Type.Boolean()),
   execApprovalFollowupExpectedSessionId: Type.Optional(NonEmptyString),
   internalEvents: Type.Optional(Type.Array(AgentInternalEventSchema)),
   inputProvenance: Type.Optional(InputProvenanceSchema),

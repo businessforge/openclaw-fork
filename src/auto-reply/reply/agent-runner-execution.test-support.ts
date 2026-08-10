@@ -1,11 +1,10 @@
 // Shared mocks and fixtures for agent-runner execution tests.
 import { afterEach, beforeEach, expect, vi } from "vitest";
 import { testing as cliBackendsTesting } from "../../agents/cli-backends.test-support.js";
-import { AUTH_INVALID_TOKEN_USER_TEXT } from "../../agents/embedded-agent-helpers/errors.js";
+import { AUTH_INVALID_TOKEN_USER_TEXT } from "../../agents/embedded-agent-helpers/error-text.js";
 import type { runEmbeddedAgentEntry } from "../../agents/embedded-agent-runner/run-entry.js";
 import type { EmbeddedAgentRunResult } from "../../agents/embedded-agent-runner/types.js";
 import type { ModelDefinitionConfig } from "../../config/types.models.js";
-import type { ReplyOptionsWithHeartbeatRunScope } from "../../infra/heartbeat-run-scope.js";
 import {
   createUserTurnTranscriptRecorder,
   type PersistedUserTurnMessage,
@@ -32,7 +31,6 @@ const state = vi.hoisted(() => ({
   runEmbeddedAgentMock: vi.fn(),
   runEmbeddedAgentEntryMock: vi.fn(),
   runCliAgentMock: vi.fn(),
-  runCliAgentActual: undefined as RunCliAgent | undefined,
   runWithModelFallbackMock: vi.fn(),
   isCliProviderMock: vi.fn((_: unknown) => false),
   isInternalMessageChannelMock: vi.fn((_: unknown) => false),
@@ -79,19 +77,48 @@ vi.mock("../../agents/agent-bundle-mcp-manager-api.js", () => ({
   peekSessionMcpRuntime: (params: unknown) => state.peekSessionMcpRuntimeMock(params),
 }));
 
-vi.mock("../../agents/cli-runner.js", async () => {
-  const actual = await vi.importActual<typeof import("../../agents/cli-runner.js")>(
-    "../../agents/cli-runner.js",
-  );
-  state.runCliAgentActual = actual.runCliAgent;
-  return {
-    ...actual,
-    runCliAgent: (params: unknown) => state.runCliAgentMock(params),
-  };
-});
+vi.mock("../../agents/cli-runner.js", () => ({
+  runCliAgent: (params: unknown) => state.runCliAgentMock(params),
+}));
 
 vi.mock("../../agents/model-fallback-runner.js", () => ({
-  runWithModelFallback: (params: unknown) => state.runWithModelFallbackMock(params),
+  runWithModelFallback: async (params: unknown) => {
+    const input = params as {
+      classifyResult?: (classification: { result: unknown; [key: string]: unknown }) => unknown;
+      [key: string]: unknown;
+    };
+    const adapted = input.classifyResult
+      ? {
+          ...input,
+          classifyResult: (classification: { result: unknown; [key: string]: unknown }) => {
+            const candidate = classification.result;
+            const wrappedCandidate =
+              candidate && typeof candidate === "object" && "result" in candidate
+                ? candidate
+                : { result: candidate };
+            return input.classifyResult?.({
+              ...classification,
+              result: wrappedCandidate,
+            });
+          },
+        }
+      : input;
+    const resolved = (await state.runWithModelFallbackMock(adapted)) as {
+      outcome?: "completed" | "exhausted";
+      result?: unknown;
+      [key: string]: unknown;
+    };
+    const candidate = resolved?.result;
+    const wrappedCandidate =
+      candidate && typeof candidate === "object" && "result" in candidate
+        ? candidate
+        : { result: candidate };
+    return {
+      ...resolved,
+      outcome: resolved.outcome ?? "completed",
+      result: wrappedCandidate,
+    };
+  },
 }));
 
 vi.mock("../../agents/model-fallback-attempt.js", () => ({
@@ -311,6 +338,12 @@ export async function getExecuteAgentTurnForTest() {
   };
 }
 
+export async function loadActualRunCliAgentForTest(): Promise<RunCliAgent> {
+  return (
+    await vi.importActual<typeof import("../../agents/cli-runner.js")>("../../agents/cli-runner.js")
+  ).runCliAgent;
+}
+
 export type FallbackRunnerParams = {
   provider: string;
   model: string;
@@ -327,6 +360,9 @@ export type FallbackRunnerParams = {
 };
 
 export type EmbeddedAgentParams = {
+  runId: string;
+  sessionId?: string;
+  sessionKey?: string;
   prompt?: string;
   transcriptPrompt?: string;
   lifecycleGeneration?: string;
@@ -571,7 +607,7 @@ export function expectBlockReplyCall(
 
 export function createMinimalRunAgentTurnParams(overrides?: {
   followupRun?: FollowupRun;
-  opts?: GetReplyOptions & ReplyOptionsWithHeartbeatRunScope;
+  opts?: GetReplyOptions;
   replyOperation?: ReplyOperation;
   sessionCtx?: TemplateContext;
   typingSignals?: TypingSignaler;

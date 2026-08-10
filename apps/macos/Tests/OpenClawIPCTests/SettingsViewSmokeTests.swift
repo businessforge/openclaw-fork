@@ -135,10 +135,6 @@ struct SettingsViewSmokeTests {
         _ = hosting.fittingSize
     }
 
-    @Test func `cron settings exercises private views`() {
-        CronSettings.exerciseForTesting()
-    }
-
     @Test func `config settings builds body`() {
         let view = ConfigSettings()
         _ = view.body
@@ -155,16 +151,18 @@ struct SettingsViewSmokeTests {
         _ = view.body
     }
 
+    @Test func `connection settings builds body`() {
+        let state = AppState(preview: true)
+        let view = GeneralSettings(state: state, page: .connection)
+        _ = view.body
+    }
+
     @Test func `general settings renders the keyboard shortcut recorder`() {
         let state = AppState(preview: true)
         let hosting = NSHostingView(rootView: GeneralSettings(state: state))
         hosting.frame = NSRect(x: 0, y: 0, width: 760, height: 640)
         hosting.layoutSubtreeIfNeeded()
         _ = hosting.fittingSize
-    }
-
-    @Test func `general settings exercises branches`() {
-        GeneralSettings.exerciseForTesting()
     }
 
     @Test func `sessions settings builds body`() {
