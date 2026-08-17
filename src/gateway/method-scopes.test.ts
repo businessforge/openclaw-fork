@@ -39,6 +39,27 @@ afterEach(() => {
 });
 
 describe("method scope resolution", () => {
+  it("requires write scope before sessions.assignOwner visibility is considered", () => {
+    const params = {
+      key: "agent:main:shared",
+      owner: { type: "human", id: "profile-next" },
+    };
+    expect(resolveLeastPrivilegeOperatorScopesForMethod("sessions.assignOwner", params)).toEqual([
+      "operator.write",
+    ]);
+    expect(
+      authorizeOperatorScopesForMethod("sessions.assignOwner", ["operator.read"], params),
+    ).toEqual({
+      allowed: false,
+      missingScope: "operator.write",
+    });
+    expect(
+      authorizeOperatorScopesForMethod("sessions.assignOwner", ["operator.write"], params),
+    ).toEqual({
+      allowed: true,
+    });
+  });
+
   it.each([
     ["sessions.resolve", ["operator.read"]],
     ["tasks.list", ["operator.read"]],
@@ -59,6 +80,7 @@ describe("method scope resolution", () => {
     ["sessions.create", ["operator.write"]],
     ["sessions.dispatch", ["operator.admin"]],
     ["sessions.reclaim", ["operator.admin"]],
+    ["sessions.move", ["operator.admin"]],
     ["sessions.send", ["operator.write"]],
     ["sessions.abort", ["operator.write"]],
     ["sessions.patchMany", ["operator.write"]],
@@ -74,9 +96,18 @@ describe("method scope resolution", () => {
     ["worktrees.list", ["operator.read"]],
     ["worktrees.branches", ["operator.write"]],
     ["worktrees.create", ["operator.admin"]],
+    ["projects.list", ["operator.read"]],
+    ["users.prefs.get", ["operator.read"]],
+    ["users.prefs.set", ["operator.write"]],
+    ["projects.register", ["operator.admin"]],
+    ["projects.remove", ["operator.admin"]],
+    ["projects.add", ["operator.write"]],
+    ["projects.searchRemote", ["operator.read"]],
     ["sessions.groups.list", ["operator.read"]],
+    ["sessions.groups.defaults", ["operator.write"]],
     ["sessions.groups.put", ["operator.write"]],
     ["sessions.groups.rename", ["operator.write"]],
+    ["sessions.groups.update", ["operator.write"]],
     ["sessions.groups.delete", ["operator.write"]],
     ["sessions.catalog.list", ["operator.read"]],
     ["sessions.catalog.read", ["operator.read"]],
@@ -87,6 +118,7 @@ describe("method scope resolution", () => {
     ["session.discussion.open", ["operator.write"]],
     ["environments.status", ["operator.read"]],
     ["diagnostics.stability", ["operator.read"]],
+    ["gateway.restart.preflight", ["operator.read"]],
     ["skills.curator.status", ["operator.read"]],
     ["hooks.status", ["operator.read"]],
     ["skills.curator.pin", ["operator.admin"]],
@@ -108,6 +140,9 @@ describe("method scope resolution", () => {
     ["talk.session.close", ["operator.talk"]],
     ["update.status", ["operator.admin"]],
     ["update.hold", ["operator.admin"]],
+    ["secrets.store.list", ["operator.admin"]],
+    ["secrets.store.set", ["operator.admin"]],
+    ["secrets.store.delete", ["operator.admin"]],
     ["config.schema", ["operator.admin"]],
     ["config.patch", ["operator.admin"]],
     ["nativeHook.invoke", ["operator.admin"]],
@@ -388,6 +423,16 @@ describe("method scope resolution", () => {
     ).toEqual({ allowed: false, missingScope: "operator.admin" });
   });
 
+  it("keeps sessions.create project IDs at write scope", () => {
+    const params = { projectId: "openclaw", worktree: true };
+    expect(resolveLeastPrivilegeOperatorScopesForMethod("sessions.create", params)).toEqual([
+      "operator.write",
+    ]);
+    expect(authorizeOperatorScopesForMethod("sessions.create", ["operator.write"], params)).toEqual(
+      { allowed: true },
+    );
+  });
+
   it("requires admin for incognito session creation and inheritance", () => {
     const incognitoKey = "agent:main:dashboard:incognito-parent";
     for (const params of [
@@ -597,6 +642,21 @@ describe("method scope resolution", () => {
         key: "agent:main:old",
         archivedOnly: true,
         expectedSessionId: "sess-1",
+      }),
+    ).toEqual({ allowed: true });
+    expect(
+      resolveLeastPrivilegeOperatorScopesForMethod("sessions.delete", {
+        key: "agent:main:old",
+        archivedOnly: true,
+        expectedSessionId: "sess-1",
+      }),
+    ).toEqual(["operator.write"]);
+    expect(
+      authorizeOperatorScopesForMethod("sessions.delete", ["operator.write"], {
+        key: "agent:main:old",
+        archivedOnly: true,
+        expectedSessionId: "sess-1",
+        futureField: true,
       }),
     ).toEqual({ allowed: false, missingScope: "operator.admin" });
     expect(
@@ -845,6 +905,7 @@ describe("core gateway method classification", () => {
     expect(isGatewayMethodClassified("node.pluginSurface.refresh")).toBe(true);
     expect(isGatewayMethodClassified("node.pluginTools.update")).toBe(true);
     expect(isGatewayMethodClassified("node.skills.update")).toBe(true);
+    expect(isGatewayMethodClassified("node.runnerInventory.update")).toBe(true);
   });
 
   it("classifies every exposed core gateway handler method", () => {

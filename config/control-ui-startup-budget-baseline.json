@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 325675,
-  "reason": "fullscreen terminal route and toolbar open action (PR #121451); CI-measured QA-profile bytes",
-  "updatedAt": "2026-08-10"
+  "startupJsGzipBytes": 338241,
+  "reason": "session placement move controls, ownership chips, assignment menus, and participant stack",
+  "updatedAt": "2026-08-17"
 }

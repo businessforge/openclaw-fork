@@ -1,10 +1,4 @@
-export * from "./clawhub-trust-error-details.js";
-export * from "./system-agent-error-details.js";
-export {
-  isMcpAppViewExpiredError,
-  readMissingScopeError,
-  readMissingScopeErrorDetails,
-} from "./gateway-error-details.js";
+export * from "./error-details.js";
 export * from "./session-agent-status.js";
 export * from "./terminal-validators.js";
 export {
@@ -17,26 +11,31 @@ export type { ProtocolValidator } from "./protocol-validator.js";
 export * from "./schema/worker-inference.js";
 export * from "./schema/skill-history.js";
 export * from "./schema/ui-command.js";
-export type {
-  GatewayErrorDetails,
-  McpAppViewExpiredErrorDetails,
-  MissingScopeErrorDetails,
-  WizardNotFoundErrorDetails,
-} from "./schema/error-codes.js";
 export * from "./schema/board.js";
 export {
   SessionCreatedActorSchema,
+  SessionOwnerSchema,
   SessionToolOverridesSchema,
   type SessionCreatedActor,
+  type SessionOwner,
   type SessionRow,
   type SessionRunStatus,
   type SessionToolOverrides,
 } from "./schema/sessions-row.js";
 export * from "./schema/session-classification.js";
 export * from "./schema/sessions-suggestions.js";
+export * from "./schema/projects.js";
 export * from "./migration-api.js";
 export type * from "./public-session-catalog.js";
 export * from "./validator-registry.js";
+export type {
+  SecretStoreEntry,
+  SecretsStoreDeleteParams,
+  SecretsStoreListResult,
+  SecretsStoreMutationResult,
+  SecretsStoreSetParams,
+} from "./schema/secrets.js";
+export * from "./schema/portals.js";
 // Explicit schema exports keep public protocol changes reviewable.
 export {
   isCloudWorkerPlacementState,
@@ -63,9 +62,6 @@ export {
   PresenceEntrySchema,
   SnapshotSchema,
   ErrorShapeSchema,
-  GatewayErrorDetailsSchema,
-  MissingScopeErrorDetailsSchema,
-  WizardNotFoundErrorDetailsSchema,
   WorkerAdmissionFailureReasonSchema,
   WorkerAdmissionHandshakeSchema,
   WorkerAdmissionResponseFrameSchema,
@@ -73,6 +69,11 @@ export {
   WorkerHeartbeatParamsSchema,
   WorkerHeartbeatRequestFrameSchema,
   WorkerHeartbeatResponseFrameSchema,
+  WorkerSessionsSpawnParamsSchema,
+  WorkerSessionsSpawnResponseFrameSchema,
+  WorkerSessionsSendParamsSchema,
+  WorkerSessionsSendResponseFrameSchema,
+  WorkerSessionToolResultSchema,
   WorkerLiveEventSchema,
   WorkerLiveEventErrorDetailsSchema,
   WorkerLiveEventErrorShapeSchema,
@@ -88,9 +89,12 @@ export {
   WorkerTranscriptCommitResponseFrameSchema,
   WorkerTranscriptCommitResultSchema,
   WorkerTranscriptMessageSchema,
+  WORKER_BUNDLE_PREWARM_VERSION,
   WORKER_HEARTBEAT_INTERVAL_MS,
   WORKER_LAUNCH_V2_PROTOCOL_FEATURE,
   WORKER_LIVE_EVENT_PROTOCOL_FEATURE,
+  WORKER_SESSION_TOOLS_PROTOCOL_FEATURE,
+  WORKER_SESSION_TOOL_MAX_TEXT_LENGTH,
   WORKER_PROTOCOL_FEATURES,
   WORKER_PROTOCOL_MAX_FEATURE_LENGTH,
   WORKER_PROTOCOL_MAX_FEATURES,
@@ -108,6 +112,7 @@ export {
   EnvironmentStatusSchema,
   WorkerEnvironmentStateSchema,
   WorkerTunnelStatusSchema,
+  WorkerDesktopAppIdSchema,
   WorkerEnvironmentMetadataSchema,
   EnvironmentSummarySchema,
   EnvironmentsCreateParamsSchema,
@@ -120,6 +125,12 @@ export {
   EnvironmentsStatusResultSchema,
   WorkerDesktopObserveParamsSchema,
   WorkerDesktopObserveResultSchema,
+  WorkerDesktopLaunchParamsSchema,
+  WorkerDesktopLaunchResultSchema,
+  DesktopSourceSchema,
+  DesktopObserveParamsSchema,
+  DesktopObserveResultSchema,
+  DesktopLaunchParamsSchema,
   SystemInfoParamsSchema,
   SystemInfoResultSchema,
   StateVersionSchema,
@@ -146,6 +157,14 @@ export {
   WakeParamsSchema,
   PushTestParamsSchema,
   PushTestResultSchema,
+  SecretStoreSecretEntrySchema,
+  SecretStoreEnvEntrySchema,
+  SecretStoreEntrySchema,
+  SecretsStoreListParamsSchema,
+  SecretsStoreListResultSchema,
+  SecretsStoreSetParamsSchema,
+  SecretsStoreDeleteParamsSchema,
+  SecretsStoreMutationResultSchema,
   WebPushVapidPublicKeyParamsSchema,
   WebPushSubscribeParamsSchema,
   WebPushUnsubscribeParamsSchema,
@@ -213,8 +232,10 @@ export {
   SessionsFilesListResultSchema,
   SessionsFilesRevealParamsSchema,
   SessionsFilesRevealResultSchema,
+  SessionDiffCommitSchema,
   SessionDiffFileSchema,
   SessionDiffFileStatusSchema,
+  SessionDiffScopeSchema,
   SessionsDiffParamsSchema,
   SessionsDiffResultSchema,
   SessionsCompactionListParamsSchema,
@@ -261,10 +282,23 @@ export {
   SessionWorktreeInfoSchema,
   SessionsCreateParamsSchema,
   SessionsCreateResultSchema,
+  SessionsRecoverParamsSchema,
+  SessionsRecoverResultSchema,
   SessionsDispatchParamsSchema,
   SessionsDispatchResultSchema,
   SessionsReclaimParamsSchema,
+  SessionsReclaimResultPlacementSchema,
   SessionsReclaimResultSchema,
+  SessionMoveExpectedSourceSchema,
+  SessionMoveGatewayTargetSchema,
+  SessionMoveProfileTargetSchema,
+  SessionMoveDeviceTargetSchema,
+  SessionMoveTargetSchema,
+  SessionPlacementMoveSchema,
+  SessionsMoveParamsSchema,
+  SessionMovePlacementStateSchema,
+  SessionMovePlacementSchema,
+  SessionsMoveResultSchema,
   SessionsSendParamsSchema,
   SessionsAbortParamsSchema,
   SESSIONS_PATCH_MANY_MAX_TARGETS,
@@ -276,11 +310,20 @@ export {
   SessionsPluginPatchParamsSchema,
   SessionsResetParamsSchema,
   SessionsDeleteParamsSchema,
+  SessionsAssignOwnerParamsSchema,
+  SessionsAssignOwnerResultSchema,
+  type SessionsAssignOwnerParams,
+  type SessionsAssignOwnerResult,
   SessionGroupSchema,
+  SessionGroupDefaultsSchema,
   SessionsGroupsListParamsSchema,
   SessionsGroupsListResultSchema,
+  SessionsGroupsDefaultsParamsSchema,
+  SessionsGroupsDefaultsResultSchema,
   SessionsGroupsPutParamsSchema,
   SessionsGroupsRenameParamsSchema,
+  SessionsGroupsUpdateParamsSchema,
+  SessionsGroupsUpdateResultSchema,
   SessionsGroupsDeleteParamsSchema,
   SessionsGroupsMutationResultSchema,
   SessionsCompactParamsSchema,
@@ -319,6 +362,10 @@ export {
   UsersLinkEmailResultSchema,
   UsersListParamsSchema,
   UsersListResultSchema,
+  UsersPrefsGetParamsSchema,
+  UsersPrefsGetResultSchema,
+  UsersPrefsSetParamsSchema,
+  UsersPrefsSetResultSchema,
   UsersSelfParamsSchema,
   UsersSelfResultSchema,
   UsersSetAvatarParamsSchema,
@@ -605,6 +652,19 @@ export {
   UpdateRunParamsSchema,
   TickEventSchema,
   ShutdownEventSchema,
+  ProjectRecordSchema,
+  ProjectRecentSchema,
+  ProjectsListParamsSchema,
+  ProjectsListResultSchema,
+  ProjectsRegisterParamsSchema,
+  ProjectsRegisterResultSchema,
+  ProjectsAddParamsSchema,
+  ProjectsAddResultSchema,
+  RemoteProjectSchema,
+  ProjectsSearchRemoteParamsSchema,
+  ProjectsSearchRemoteResultSchema,
+  ProjectsRemoveParamsSchema,
+  ProjectsRemoveResultSchema,
   WorktreeRecordSchema,
   WorktreesListParamsSchema,
   WorktreesListResultSchema,
@@ -621,11 +681,6 @@ export {
   FsDirEntrySchema,
   FsListDirParamsSchema,
   FsListDirResultSchema,
-  ErrorCodes,
-  buildMissingScopeErrorDetails,
-  GatewayErrorDetailCodes,
-  errorShape,
-  missingScopeErrorShape,
 } from "./schema-modules.js";
 export {
   MIN_CLIENT_PROTOCOL_VERSION,
@@ -634,18 +689,4 @@ export {
   PROTOCOL_VERSION,
 } from "./version.js";
 export type * from "./schema-types.js";
-
-// Local structural result keeps this package independent of core session types.
-export type SessionsPatchResult = {
-  ok: true;
-  path: string;
-  key: string;
-  entry: Record<string, unknown>;
-  resolved?: {
-    modelProvider?: string;
-    model?: string;
-    agentRuntime?: import("./schema/agents-models-skills.js").GatewayAgentRuntime;
-    thinkingLevel?: string;
-    thinkingLevels?: Array<{ id: string; label: string }>;
-  };
-};
+export type { SessionsPatchResult } from "./sessions-patch-result.js";

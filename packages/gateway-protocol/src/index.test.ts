@@ -41,13 +41,11 @@ import {
   validateTalkSessionSteerParams,
   validateWakeParams,
   type ValidationError,
-} from "./index.js";
-import type {
-  ConfigSchemaLookupParams,
-  ModelsListParams,
-  SessionsCatalogListParams,
-  SessionsCatalogStartTerminalParams,
-  TalkEvent,
+  type ConfigSchemaLookupParams,
+  type ModelsListParams,
+  type SessionsCatalogListParams,
+  type SessionsCatalogStartTerminalParams,
+  type TalkEvent,
 } from "./index.js";
 import type * as Schema from "./schema.js";
 import { ProtocolSchemas } from "./schema/protocol-schemas.js";
@@ -168,8 +166,9 @@ describe("lazy protocol validators", () => {
       { archived: false },
       { archived: true },
       { archived: "all" },
+      { involvingMe: true },
     ]);
-    expectRejected(validateSessionsListParams, [{ archived: "archived" }]);
+    expectRejected(validateSessionsListParams, [{ archived: "archived" }, { involvingMe: "yes" }]);
   });
 
   it("validates session board face list and patch values", () => {
@@ -297,6 +296,7 @@ describe("lazy protocol validators", () => {
     expectRejected(validateConnectParams, [{}]);
     expect(formatValidationErrors(validateConnectParams.errors)).toContain("must have required");
     expectAccepted(validateConnectParams, [connect]);
+    expectAccepted(validateConnectParams, [{ ...connect, computerUse: { version: 2 } }]);
     expect(validateConnectParams.errors).toBeNull();
   });
 
@@ -518,6 +518,27 @@ describe("lazy protocol validators", () => {
         expiresAtMs: -1,
         control: false,
       },
+    ]);
+  });
+
+  it("validates closed worker desktop app launch contracts", () => {
+    expectAccepted(protocol.validateWorkerDesktopLaunchParams, [
+      { environmentId: "worker:one", app: "browser" },
+      { environmentId: "worker:one", app: "terminal" },
+    ]);
+    expectRejected(protocol.validateWorkerDesktopLaunchParams, [
+      { environmentId: "", app: "browser" },
+      { environmentId: "worker:one", app: "editor" },
+      { environmentId: "worker:one", app: "browser", args: [] },
+    ]);
+    expectAccepted(protocol.validateWorkerDesktopLaunchResult, [
+      { app: "browser", status: "ready" },
+      { app: "terminal", status: "ready" },
+    ]);
+    expectRejected(protocol.validateWorkerDesktopLaunchResult, [
+      { app: "editor", status: "ready" },
+      { app: "browser", status: "starting" },
+      { app: "browser", status: "ready", executablePath: "/usr/bin/chromium" },
     ]);
   });
 
@@ -984,6 +1005,8 @@ describe("validateModelsListParams", () => {
       { view: "default" },
       { view: "configured" },
       { view: "all" },
+      { view: "configured", preparedOnly: true },
+      { view: "all", refresh: true },
     ]);
   });
 

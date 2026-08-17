@@ -6,6 +6,7 @@ import {
   registerWhatsAppApprovalReactionTarget,
   resolveWhatsAppApprovalReactionTargetWithPersistence,
 } from "./approval-reactions.js";
+import * as whatsappRuntime from "./runtime.js";
 import { resolveEquivalentWhatsAppDirectChatJids } from "./text-runtime.js";
 
 type LidLookup = NonNullable<
@@ -150,6 +151,39 @@ describe("WhatsApp approval reactions", () => {
     });
   });
 
+  it("rejects persisted targets containing an invalid approval decision", async () => {
+    const runtime = vi.spyOn(whatsappRuntime, "getOptionalWhatsAppRuntime").mockReturnValue({
+      state: {
+        openKeyedStore: () => ({
+          register: async () => {},
+          lookup: async () => ({
+            version: 1,
+            target: {
+              approvalId: "exec-corrupt",
+              approvalKind: "exec",
+              allowedDecisions: ["allow-once", "invalid"],
+            },
+          }),
+          delete: async () => false,
+        }),
+      },
+    } as never);
+    try {
+      clearWhatsAppApprovalReactionTargetsForTest();
+      await expect(
+        resolveWhatsAppApprovalReactionTargetWithPersistence({
+          accountId: "default",
+          remoteJid: "15551230000@s.whatsapp.net",
+          messageId: "corrupt-message",
+          reactionKey: "👍",
+        }),
+      ).resolves.toBeNull();
+    } finally {
+      clearWhatsAppApprovalReactionTargetsForTest();
+      runtime.mockRestore();
+    }
+  });
+
   it("authorizes group reactions using the participant, not the group chat", async () => {
     registerWhatsAppApprovalReactionTarget({
       accountId: "default",
@@ -178,6 +212,7 @@ describe("WhatsApp approval reactions", () => {
       approvalKind: "plugin",
       decision: "allow-once",
       channel: "whatsapp",
+      accountId: "default",
       senderId: "+15551230000",
       gatewayUrl: undefined,
     });
@@ -255,6 +290,7 @@ describe("WhatsApp approval reactions", () => {
       approvalKind: "exec",
       decision: "allow-once",
       channel: "whatsapp",
+      accountId: "default",
       senderId: "+15551230001",
       gatewayUrl: undefined,
     });
@@ -320,6 +356,7 @@ describe("WhatsApp approval reactions", () => {
       approvalKind: "exec",
       decision: "allow-once",
       channel: "whatsapp",
+      accountId: "default",
       senderId: testCase.actorId,
       gatewayUrl: undefined,
     });
