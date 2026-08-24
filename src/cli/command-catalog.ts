@@ -115,6 +115,10 @@ export const cliCommandCatalog: readonly CliCommandCatalogEntry[] = [
   },
   { commandPath: ["message"], policy: { loadPlugins: "never" } },
   { commandPath: ["docs"], policy: { configGuard: "skip" } },
+  // Destructive maintenance owns a validity-aware, non-observing config read.
+  // Startup migrations would mutate the SQLite state these commands may refuse to remove.
+  { commandPath: ["reset"], policy: { configGuard: "skip" } },
+  { commandPath: ["uninstall"], policy: { configGuard: "skip" } },
   {
     commandPath: ["channels"],
     policy: {
@@ -184,6 +188,10 @@ export const cliCommandCatalog: readonly CliCommandCatalogEntry[] = [
     route: { id: "status" },
   },
   {
+    commandPath: ["telemetry"],
+    policy: { configGuard: "skip", loadPlugins: "never", networkProxy: "bypass" },
+  },
+  {
     commandPath: ["health"],
     policy: {
       configGuard: "skip",
@@ -227,7 +235,10 @@ export const cliCommandCatalog: readonly CliCommandCatalogEntry[] = [
       policy: { configGuard: "validate", loadPlugins: "never", networkProxy: "bypass" },
     }),
   ),
-  { commandPath: ["gateway", "diagnostics"], exact: true, policy: { networkProxy: "bypass" } },
+  {
+    commandPath: ["gateway", "diagnostics"],
+    policy: { configGuard: "skip", loadPlugins: "never", networkProxy: "bypass" },
+  },
   { commandPath: ["gateway", "discover"], exact: true, policy: { networkProxy: "bypass" } },
   {
     commandPath: ["gateway", "health"],

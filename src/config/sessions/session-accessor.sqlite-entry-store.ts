@@ -6,9 +6,10 @@ import {
 } from "../../infra/kysely-sync.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
+import type { ConversationRouteContext } from "./conversation-route-context.js";
 import {
   linkSessionConversation,
-  prepareSessionConversation,
+  prepareSessionConversationForWrite,
   upsertConversationIdentity,
 } from "./session-accessor.sqlite-conversation.js";
 import {
@@ -16,14 +17,15 @@ import {
   trackSessionEntryCacheWrite,
 } from "./session-accessor.sqlite-entry-cache.js";
 import {
+  sqliteLifecycleTargetSnapshotsEqual,
   sqliteSessionEntriesEqual,
   sqliteSessionSnapshotRowsEqual,
 } from "./session-accessor.sqlite-entry-equality.js";
 import {
   clearSessionCollaborationForKey,
+  copySessionNodeArtifactsForRepair,
   deleteSessionDeliveryArtifacts,
   deleteSessionNodeArtifacts,
-  rehomeLegacySessionNodeArtifacts,
 } from "./session-accessor.sqlite-node-artifacts.js";
 import {
   hasSqliteSessionOwnerColumns,
@@ -232,7 +234,7 @@ export function readExactSessionEntryRow(
   return entry ? { entry, legacyKeys: [], row } : undefined;
 }
 
-export function readExactSessionEntryJsonForCanonicalRepair(
+export function readExactSessionEntryJson(
   database: Pick<OpenClawAgentDatabase, "db">,
   sessionKey: string,
 ): string | undefined {
@@ -261,10 +263,7 @@ export function readSessionEntryStore(
   const db = getSessionKysely(database.db);
   const rows = executeSqliteQuerySync(
     database.db,
-    db
-      .selectFrom("session_nodes")
-      .select(["current_session_id", "entry_json", "session_key", "updated_at"])
-      .orderBy("session_key"),
+    db.selectFrom("session_nodes").selectAll().orderBy("session_key"),
   ).rows;
   const store: Record<string, SessionEntry> = {};
   for (const row of rows) {
@@ -343,10 +342,7 @@ export function assertLifecycleTargetSnapshotUnchanged(
   current: SqliteLifecycleTargetSnapshot,
   operationLabel: string,
 ): void {
-  const primaryMatches =
-    expected.primary?.key === current.primary?.key &&
-    sqliteSessionEntriesEqual(expected.primary?.entry, current.primary?.entry);
-  if (!primaryMatches || !sqliteSessionSnapshotRowsEqual(expected.rows, current.rows)) {
+  if (!sqliteLifecycleTargetSnapshotsEqual(expected, current)) {
     throw new SqliteSessionMutationConflictError(operationLabel);
   }
 }
@@ -543,7 +539,9 @@ export function deleteLegacySessionEntryRows(
       continue;
     }
     rehomeSessionWindows(database, sessionKey, [legacyKey]);
-    rehomeLegacySessionNodeArtifacts(database, legacyKey, sessionKey, options);
+    copySessionNodeArtifactsForRepair(database, database, [legacyKey], sessionKey, {
+      includeMembers: options.rehomeMembers,
+    });
     executeSqliteQuerySync(
       database.db,
       db.deleteFrom("session_nodes").where("session_key", "=", legacyKey),
@@ -582,6 +580,7 @@ export function writeSessionEntry(
     allowStoredAliases?: boolean;
     preserveNodeSuggestions?: boolean;
     previousEntry?: SessionEntry | null;
+    routeContext?: ConversationRouteContext | null;
   } = {},
 ): void {
   const db = getSessionKysely(database.db);
@@ -633,8 +632,11 @@ export function writeSessionEntry(
     readTranscriptMutationStateInTransaction(database, normalizedEntry.sessionId).updatedAt ??
     updatedAt;
   const boundSessionRoot = bindSessionRoot({ entry: normalizedEntry, sessionKey, updatedAt });
-  const conversation = prepareSessionConversation({
+  const conversation = prepareSessionConversationForWrite({
+    database,
     entry: normalizedEntry,
+    previousEntry,
+    ...(options.routeContext !== undefined ? { routeContext: options.routeContext } : {}),
     sessionScope: boundSessionRoot.session_scope,
   });
   if (conversation) {
@@ -729,6 +731,7 @@ export function writeSessionEntry(
   if (conversation) {
     linkSessionConversation({
       database,
+      ...(previousEntry?.sessionId ? { previousSessionId: previousEntry.sessionId } : {}),
       sessionId: sessionRow.session_id,
       conversation,
       updatedAt,

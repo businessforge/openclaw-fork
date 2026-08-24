@@ -7,6 +7,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   readlinkSync,
   rmSync,
   symlinkSync,
@@ -22,6 +23,7 @@ import {
   writeNpmBeforePolicyFixture,
   writeNpmFreshnessConflictFixture,
   writeNpmInstallRetryFixture,
+  writeNpmLifecycleFixture,
 } from "./install-npm-fixtures.js";
 
 const SCRIPT_PATH = "scripts/install-cli.sh";
@@ -44,7 +46,14 @@ function linkRequiredShellTools(bin: string) {
   }
 }
 
+function linkNodeExecutable(nodeDir: string) {
+  const bin = join(nodeDir, "bin");
+  mkdirSync(bin, { recursive: true });
+  symlinkSync(process.execPath, join(bin, "node"));
+}
+
 function writeInstalledOpenClawEntry(nodeDir: string) {
+  linkNodeExecutable(nodeDir);
   const entry = join(nodeDir, "lib", "node_modules", "openclaw", "dist", "entry.js");
   mkdirSync(join(entry, ".."), { recursive: true });
   writeFileSync(entry, "");
@@ -228,6 +237,164 @@ describe("install-cli.sh", () => {
     `);
 
     expect(result.status).toBe(0);
+  });
+
+  it("keeps a pre-existing empty Git install destination retryable after clone failure", () => {
+    const root = tempDirs.make("openclaw-install-cli-empty-retry-");
+    const repo = join(root, "openclaw");
+    mkdirSync(repo);
+    const runAttempt = (cloneMode: "failure" | "success") =>
+      runInstallCliShell(
+        `
+        set -euo pipefail
+        source "${SCRIPT_PATH}"
+        ensure_git() { :; }
+        ensure_pnpm() { :; }
+        ensure_pnpm_binary_for_scripts() { :; }
+        resolve_git_openclaw_ref() { printf 'main\\n'; }
+        checkout_git_openclaw_ref() { :; }
+        cleanup_legacy_submodules() { :; }
+        ensure_pnpm_git_prepare_allowlist() { :; }
+        activate_repo_pnpm_version() { :; }
+        git_install_lockfile_flag() { printf '%s\\n' '--frozen-lockfile'; }
+        run_pnpm() { :; }
+        git() {
+          if [[ "$1" == "clone" ]]; then
+            target="\${*: -1}"
+            mkdir -p "$target/.git"
+            if [[ "$CLONE_MODE" == "failure" ]]; then
+              return 42
+            fi
+            printf 'complete\\n' > "$target/checkout.marker"
+          fi
+          return 0
+        }
+        install_openclaw_from_git "$REPO"
+      `,
+        { CLONE_MODE: cloneMode, REPO: repo },
+      );
+
+    const failed = runAttempt("failure");
+    expect(failed.status, failed.stderr || failed.stdout).toBe(42);
+    expect(existsSync(repo)).toBe(true);
+    expect(readdirSync(repo)).toEqual([]);
+
+    const succeeded = runAttempt("success");
+    expect(succeeded.status, succeeded.stderr || succeeded.stdout).toBe(0);
+    expect(readFileSync(join(repo, "checkout.marker"), "utf8")).toBe("complete\n");
+  });
+
+  it("publishes fresh Git clones only after success and cleans failed staging directories", () => {
+    const root = tempDirs.make("openclaw-install-cli-transactional-clone-");
+    const result = runInstallCliShell(
+      `
+      set -euo pipefail
+      source "${SCRIPT_PATH}"
+      root="$ROOT"
+      git() {
+        local target="\${*: -1}"
+        mkdir -p "$target/.git"
+        printf 'complete\\n' > "$target/checkout.marker"
+        if [[ "$CLONE_MODE" == "failure" ]]; then
+          return 42
+        fi
+        if [[ "$CLONE_MODE" == "concurrent" ]]; then
+          mkdir -p "$CONCURRENT_REPO"
+          printf 'keep\\n' > "$CONCURRENT_REPO/user.marker"
+        fi
+        if [[ "$CLONE_MODE" == "retarget-alias" ]]; then
+          [[ "$(dirname "$target")" == "$ALIAS_TARGET" ]]
+          rm "$ALIAS_PATH"
+          ln -s "$ALIAS_REPLACEMENT" "$ALIAS_PATH"
+        fi
+      }
+
+      CLONE_MODE=success
+      success_repo="$root/success"
+      clone_git_checkout_transactionally https://example.invalid/openclaw.git "$success_repo"
+      [[ -f "$success_repo/checkout.marker" ]]
+
+      CLONE_MODE=failure
+      failed_repo="$root/failure"
+      set +e
+      clone_git_checkout_transactionally https://example.invalid/openclaw.git "$failed_repo"
+      failure_status="$?"
+      set -e
+      [[ "$failure_status" -eq 42 ]]
+      [[ ! -e "$failed_repo" ]]
+
+      CLONE_MODE=retarget-alias
+      ALIAS_TARGET="$root/alias-target"
+      ALIAS_REPLACEMENT="$root/alias-replacement"
+      ALIAS_PATH="$root/alias"
+      mkdir -p "$ALIAS_TARGET" "$ALIAS_REPLACEMENT"
+      ln -s "$ALIAS_TARGET" "$ALIAS_PATH"
+      clone_git_checkout_transactionally https://example.invalid/openclaw.git "$ALIAS_PATH"
+      [[ -f "$ALIAS_TARGET/checkout.marker" ]]
+      [[ -z "$(ls -A "$ALIAS_REPLACEMENT")" ]]
+      [[ -z "$(find "$ALIAS_TARGET" -maxdepth 1 -name '.openclaw-clone.*' -print -quit)" ]]
+
+      CLONE_MODE=concurrent
+      CONCURRENT_REPO="$root/concurrent"
+      clone_git_checkout_transactionally https://example.invalid/openclaw.git "$CONCURRENT_REPO"
+    `,
+      { ROOT: root },
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stdout + result.stderr).toContain("Git install dir appeared while cloning");
+    expect(readFileSync(join(root, "concurrent", "user.marker"), "utf8")).toBe("keep\n");
+    expect(existsSync(join(root, "concurrent", "checkout.marker"))).toBe(false);
+    expect(readdirSync(root).filter((entry) => entry.startsWith(".openclaw-clone."))).toEqual([]);
+  });
+
+  it("keeps the full Git install on the canonical checkout after an alias is retargeted", () => {
+    const root = tempDirs.make("openclaw-install-cli-retargeted-alias-");
+    const result = runInstallCliShell(
+      `
+      set -euo pipefail
+      source "${SCRIPT_PATH}"
+      target="$ROOT/target"
+      replacement="$ROOT/replacement"
+      alias_path="$ROOT/alias"
+      mkdir -p "$target" "$replacement"
+      ln -s "$target" "$alias_path"
+      PREFIX="$ROOT/prefix"
+
+      ensure_git() { :; }
+      ensure_pnpm() { :; }
+      ensure_pnpm_binary_for_scripts() { :; }
+      resolve_git_openclaw_ref() { printf 'main\\n'; }
+      checkout_git_openclaw_ref() { [[ "$1" == "$target" && "$2" == "main" ]]; }
+      cleanup_legacy_submodules() { [[ "$1" == "$target" ]]; }
+      ensure_pnpm_git_prepare_allowlist() { [[ "$1" == "$target" ]]; }
+      activate_repo_pnpm_version() { [[ "$1" == "$target" ]]; }
+      git_install_lockfile_flag() {
+        [[ "$1" == "$target" ]]
+        printf '%s\\n' '--frozen-lockfile'
+      }
+      run_pnpm() { [[ "$1" == "-C" && "$2" == "$target" ]]; }
+      git() {
+        if [[ "$1" == "clone" ]]; then
+          local clone_target="\${*: -1}"
+          mkdir -p "$clone_target/.git"
+          printf 'complete\\n' > "$clone_target/checkout.marker"
+          rm "$alias_path"
+          ln -s "$replacement" "$alias_path"
+          return 0
+        fi
+        [[ "$1" == "-C" && "$2" == "$target" ]]
+      }
+
+      install_openclaw_from_git "$alias_path"
+      grep -F "$target/dist/entry.js" "$PREFIX/bin/openclaw"
+      [[ -z "$(ls -A "$replacement")" ]]
+      [[ -z "$(find "$target" -maxdepth 1 -name '.openclaw-clone.*' -print -quit)" ]]
+    `,
+      { ROOT: root },
+    );
+
+    expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
   it("bounds stalled curl downloads and propagates timeout failures", () => {
@@ -445,7 +612,10 @@ describe("install-cli.sh", () => {
     const dependencyInstallIndex = script.indexOf(
       'CI="${CI:-true}" run_pnpm -C "$repo_dir" install "$install_lockfile_flag"',
     );
-    const wrapperIndex = script.indexOf('cat > "${PREFIX}/bin/openclaw"', compatibilityIndex);
+    const wrapperIndex = script.indexOf(
+      'publish_executable_wrapper "${PREFIX}/bin/openclaw"',
+      compatibilityIndex,
+    );
 
     expect(checkoutIndex).toBeGreaterThan(-1);
     expect(compatibilityIndex).toBeGreaterThan(checkoutIndex);
@@ -501,6 +671,7 @@ describe("install-cli.sh", () => {
           "set -euo pipefail",
           `cd ${JSON.stringify(process.cwd())}`,
           `source ${JSON.stringify(SCRIPT_PATH)}`,
+          "npm_lifecycle_allow_arg() { :; }",
           'install_node() { mkdir -p "$(node_dir)/lib/node_modules/openclaw/dist"; : > "$(node_dir)/lib/node_modules/openclaw/dist/entry.js"; }',
           "ensure_git() { :; }",
           'npm_bin() { printf "/usr/bin/true\\n"; }',
@@ -614,7 +785,7 @@ describe("install-cli.sh", () => {
       symlinkSync("node-v24.15.0", join(prefix, "tools", "node"));
       writeFileSync(
         join(nodeDir, "bin", "npm"),
-        '#!/bin/bash\nif [[ "$1" == "config" ]]; then printf "null\\n"; fi\n',
+        '#!/bin/bash\nif [[ "$1" == "--version" ]]; then printf "11.15.0\\n"; elif [[ "$1" == "config" ]]; then printf "null\\n"; fi\n',
       );
       chmodSync(join(nodeDir, "bin", "npm"), 0o755);
       for (const entry of [
@@ -1440,6 +1611,106 @@ describe("install-cli.sh", () => {
     expect(script).toContain("env -u NPM_CONFIG_BEFORE -u npm_config_before");
   });
 
+  it.each([
+    { expected: "", version: "11.15.0" },
+    { expected: "--allow-scripts=openclaw", version: "11.16.0" },
+    { expected: "--allow-scripts=openclaw", version: "12.0.0" },
+  ])("resolves canonical npm lifecycle policy for npm $version", ({ expected, version }) => {
+    const tmp = mkdtempSync(join(tmpdir(), "openclaw-install-cli-lifecycle-"));
+    const npm = join(tmp, "npm");
+    writeNpmLifecycleFixture(npm);
+    try {
+      const result = runInstallCliShell(
+        [
+          `source ${JSON.stringify(SCRIPT_PATH)}`,
+          `node_bin() { printf '%s\n' ${JSON.stringify(process.execPath)}; }`,
+          `result="$(npm_lifecycle_allow_arg ${JSON.stringify(npm)} openclaw@latest)"`,
+          `printf '%s' "$result"`,
+        ].join("\n"),
+        { NPM_FAKE_VERSION: version },
+      );
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe(expected);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["invalid", "npm 12.0.0 warning"])(
+    "rejects npm version %s before mutation",
+    (version) => {
+      const tmp = mkdtempSync(join(tmpdir(), "openclaw-install-cli-lifecycle-invalid-"));
+      const npm = join(tmp, "npm");
+      const args = join(tmp, "args");
+      writeNpmLifecycleFixture(npm);
+      try {
+        const result = runInstallCliShell(
+          [
+            `source ${JSON.stringify(SCRIPT_PATH)}`,
+            `node_bin() { printf '%s\n' ${JSON.stringify(process.execPath)}; }`,
+            `npm_lifecycle_allow_arg ${JSON.stringify(npm)} openclaw@latest`,
+          ].join("\n"),
+          { NPM_FAKE_ARGS: args, NPM_FAKE_VERSION: version },
+        );
+        expect(result.status).not.toBe(0);
+        expect(existsSync(args)).toBe(false);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([
+    ["openclaw@npm:@scope/candidate@1.0.0", "--allow-scripts=@scope/candidate"],
+    ["file:/tmp/openclaw.tgz", "--allow-scripts=file:/tmp/openclaw.tgz"],
+    [
+      "https://example.invalid/openclaw.tgz",
+      "--allow-scripts=https://example.invalid/openclaw.tgz",
+    ],
+  ])("uses npm-resolved lifecycle identity for %s", (spec, expected) => {
+    const tmp = mkdtempSync(join(tmpdir(), "openclaw-install-cli-identity-"));
+    const npm = join(tmp, "npm");
+    writeNpmLifecycleFixture(npm);
+    try {
+      const result = runInstallCliShell(
+        [
+          `source ${JSON.stringify(SCRIPT_PATH)}`,
+          `node_bin() { printf '%s\n' ${JSON.stringify(process.execPath)}; }`,
+          `npm_lifecycle_allow_arg ${JSON.stringify(npm)} ${JSON.stringify(spec)}`,
+        ].join("\n"),
+        { NPM_FAKE_VERSION: "12.0.0" },
+      );
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim()).toBe(expected);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("relativizes absolute npm path identities against the command cwd", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "openclaw-install-cli-identity-comma,"));
+    const npm = join(tmp, "npm");
+    const commandCwd = join(tmp, "safe");
+    const candidate = join(tmp, "candidate.tgz");
+    mkdirSync(commandCwd);
+    writeNpmLifecycleFixture(npm);
+    try {
+      const result = runInstallCliShell(
+        [
+          `source ${JSON.stringify(SCRIPT_PATH)}`,
+          `node_bin() { printf '%s\\n' ${JSON.stringify(process.execPath)}; }`,
+          `cd ${JSON.stringify(commandCwd)}`,
+          `npm_lifecycle_allow_arg ${JSON.stringify(npm)} ${JSON.stringify(candidate)} "$PWD"`,
+        ].join("\n"),
+        { NPM_FAKE_VERSION: "12.0.0" },
+      );
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim()).toBe("--allow-scripts=../candidate.tgz");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("does not emit --before when raw user npmrc config contains min-release-age", () => {
     const tmp = mkdtempSync(join(tmpdir(), "openclaw-install-cli-npmrc-"));
     const bin = join(tmp, "bin");
@@ -1479,6 +1750,7 @@ describe("install-cli.sh", () => {
           "set -euo pipefail",
           `cd ${JSON.stringify(process.cwd())}`,
           `source ${JSON.stringify(SCRIPT_PATH)}`,
+          "npm_lifecycle_allow_arg() { :; }",
           `npm_bin() { printf '%s\\n' ${JSON.stringify(fakeNpm)}; }`,
           `node_dir() { printf '%s\\n' ${JSON.stringify(nodeDir)}; }`,
           "emit_json() { :; }",
@@ -1563,6 +1835,7 @@ describe("install-cli.sh", () => {
           "set -euo pipefail",
           `cd ${JSON.stringify(process.cwd())}`,
           `source ${JSON.stringify(SCRIPT_PATH)}`,
+          "npm_lifecycle_allow_arg() { :; }",
           `npm_bin() { printf '%s\\n' ${JSON.stringify(fakeNpm)}; }`,
           `node_dir() { printf '%s\\n' ${JSON.stringify(nodeDir)}; }`,
           "emit_json() { :; }",
@@ -1653,6 +1926,7 @@ describe("install-cli.sh", () => {
       const nodeDir = join(tmp, "node");
       const prefix = join(tmp, "prefix");
       writeNpmInstallRetryFixture(fakeNpm);
+      linkNodeExecutable(nodeDir);
 
       try {
         const result = runInstallCliShell(
@@ -1703,6 +1977,7 @@ describe("install-cli.sh", () => {
     const nodeDir = join(tmp, "node");
     const prefix = join(tmp, "prefix");
     writeNpmInstallRetryFixture(fakeNpm);
+    linkNodeExecutable(nodeDir);
 
     try {
       const result = runInstallCliShell(

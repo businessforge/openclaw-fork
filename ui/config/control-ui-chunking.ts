@@ -14,17 +14,6 @@ function moduleIdIncludesPackage(id: string, packageName: string): boolean {
 export function controlUiStableChunkName(id: string): string | undefined {
   const normalized = normalizeModuleId(id);
 
-  // These entry-and-route helpers must stay together; separate shared chunks
-  // turn small route-graph changes into extra startup preload requests.
-  if (
-    normalized.endsWith("/ui/src/components/config-form.shared.ts") ||
-    normalized.endsWith("/ui/src/lib/clipboard.ts") ||
-    normalized.endsWith("/ui/src/build-info-normalizers.ts") ||
-    normalized.endsWith("/ui/src/build-info.ts")
-  ) {
-    return "control-ui-shared";
-  }
-
   if (normalized.endsWith("/ui/src/lib/gateway-methods.ts")) {
     return "gateway-runtime";
   }
@@ -81,9 +70,9 @@ export const controlUiCodeSplitting = {
         normalizeModuleId(id).includes("/ui/src/") ? "control-ui-core" : "control-ui-foundation",
       tags: ["$initial"] as ["$initial"],
       priority: 10,
-      // 576 KiB keeps the shared normalization graph in one chunk; the previous
-      // 512 KiB boundary split it in two, adding a startup request and ~700 B gzip.
-      maxSize: 576 * 1024,
+      // 640 KiB keeps the startup graph together; the previous 576 KiB boundary
+      // split it into two extra requests and added roughly 1 KiB of gzip.
+      maxSize: 640 * 1024,
     },
   ],
 };
