@@ -1,11 +1,11 @@
 import {
   isActiveHarnessContextEngine,
   resolveSandboxContext,
-  resolveSessionAgentIds,
   resolveUserPath,
   type FastModeAutoProgressState,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { resolveAgentDir } from "openclaw/plugin-sdk/agent-runtime";
+import { resolveSessionAgentIdsStrict } from "openclaw/plugin-sdk/agent-scope-runtime";
 import {
   createDiagnosticTraceContextFromActiveScope,
   freezeDiagnosticTraceContext,
@@ -83,11 +83,14 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
   const pluginConfig = readCodexPluginConfig(options.pluginConfig);
   const requirementsToml = readCodexRequirementsToml({});
   const computerUseConfig = resolveCodexComputerUseConfig({ pluginConfig });
-  const { sessionAgentId } = resolveSessionAgentIds({
+  const { sessionAgentId } = resolveSessionAgentIdsStrict({
     sessionKey: params.sessionKey,
     config: params.config,
     agentId: params.agentId,
   });
+  // Retained policy owns native and dynamic restrictions; execution identity still owns
+  // credentials, hooks, and bindings.
+  const policyAgentId = params.sandboxAgentId ?? sessionAgentId;
   preDynamicStartupStages.mark("config");
   const resolvedWorkspace = resolveUserPath(params.workspaceDir);
   await ensureCodexWorkspaceDirOnce(resolvedWorkspace);
@@ -100,6 +103,7 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
       ? params.sandbox
       : await resolveSandboxContext({
           config: params.config,
+          agentId: params.sandboxAgentId,
           sessionKey: sandboxSessionKey,
           workspaceDir: resolvedWorkspace,
         });
@@ -116,7 +120,7 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
     execOverrides: params.execOverrides,
     approvals: params.permissionMode === "full" ? undefined : loadExecApprovals(),
     config: params.config,
-    agentId: sessionAgentId,
+    agentId: policyAgentId,
   });
   const agentDir = params.agentDir ?? resolveAgentDir(params.config ?? {}, sessionAgentId);
   const preparedEnvironment = params.hostCapabilities.preparedEnvironment?.();
@@ -318,6 +322,7 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
   const sessionPermissionCwd = resolveCodexSessionPermissionCwd({
     permissionMode: params.permissionMode,
     sessionRoot: params.sessionRoot,
+    defaultRoot: effectiveWorkspace,
     requestedCwd,
     fallbackCwd: effectiveWorkspace,
   });
@@ -334,14 +339,16 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
       appServer,
       permissionMode: params.permissionMode,
       sessionRoot: params.sessionRoot,
+      defaultRoot: effectiveWorkspace,
       pluginConfig,
       canUseAutoReview: canUseCodexModelBackedApprovalsReviewerForModel({
         modelProvider: selection.modelProvider,
         model: selection.model,
         config: params.config,
-        env: process.env,
+        env: { ...process.env, ...appServer.start.env, ...shellEnvironment },
         agentDir,
         homeScope: appServer.start.homeScope,
+        codexArgs: appServer.start.args,
       }),
       requirementsToml,
       policyLocked: startupBinding?.connectionScope === "supervision",
@@ -357,7 +364,7 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
       provider: selection.modelProvider,
       model: selection.model,
       config: params.config,
-      env: process.env,
+      env: { ...process.env, ...session.start.env, ...shellEnvironment },
       agentDir,
     });
     return { session, appServer: withPreparedProcessEnv(trusted) };
@@ -432,6 +439,7 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
     appServer,
     permissionMode: params.permissionMode,
     sessionRoot: params.sessionRoot,
+    defaultRoot: effectiveWorkspace,
   });
   if (sessionPermissionPolicy) {
     params.permissionMode = sessionPermissionPolicy.mode;
@@ -474,6 +482,7 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
     pluginConfig,
     computerUseConfig,
     sessionAgentId,
+    policyAgentId,
     resolvedWorkspace,
     sandboxSessionKey,
     contextSessionKey,

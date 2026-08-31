@@ -355,7 +355,7 @@ describe("prepareCodexAttemptConnection", () => {
     expect(resolveModelPolicy).toHaveBeenCalledTimes(2);
   });
 
-  it("does not give OpenClaw ownership of an explicit operator approval policy", async () => {
+  it("rejects the retired explicit untrusted approval policy with Doctor remediation", async () => {
     initializeGlobalHookRunner(
       createMockPluginRegistry([{ hookName: "before_tool_call", handler: vi.fn() }]),
     );
@@ -365,18 +365,20 @@ describe("prepareCodexAttemptConnection", () => {
     params.agentDir = path.join(tempDir, "agent");
     registerCodexTestSessionIdentity(sessionFile, params.sessionId, params.sessionKey);
 
-    const connection = await prepareCodexAttemptConnection({
-      params,
-      options: {
-        bindingStore: testCodexAppServerBindingStore,
-        pluginConfig: { appServer: { approvalPolicy: "untrusted" } },
-      },
-    });
-
-    expect(connection.appServer.approvalPolicy).toBe("untrusted");
+    await expect(
+      prepareCodexAttemptConnection({
+        params,
+        options: {
+          bindingStore: testCodexAppServerBindingStore,
+          pluginConfig: { appServer: { approvalPolicy: "untrusted" } },
+        },
+      }),
+    ).rejects.toThrow(
+      'plugins.entries.codex.config.appServer.approvalPolicy="untrusted" is retired; run "openclaw doctor --fix" to migrate it to "on-request".',
+    );
   });
 
-  it("lets a workspace session mode override explicitly configured full exec", async () => {
+  it("defaults a rootless workspace session boundary while overriding full exec", async () => {
     const sessionFile = path.join(tempDir, "workspace-session-policy.jsonl");
     const workspaceDir = path.join(tempDir, "workspace-session-policy");
     const params = createParams(sessionFile, workspaceDir);
@@ -385,7 +387,6 @@ describe("prepareCodexAttemptConnection", () => {
     // Dispatch owns mode→exec preparation; connection consumes the prepared override.
     params.execOverrides = { ...params.execOverrides, mode: "auto" };
     params.permissionMode = "workspace";
-    params.sessionRoot = workspaceDir;
     registerCodexTestSessionIdentity(sessionFile, params.sessionId, params.sessionKey);
 
     const resolveConnection = vi.spyOn(bindingConnection, "resolveCodexBindingAppServerConnection");
@@ -424,6 +425,32 @@ describe("prepareCodexAttemptConnection", () => {
 
     // Upstream 28f10c00b4e keeps YOLO approvals disabled despite generic tool hooks.
     expect(connection.appServer.approvalPolicy).toBe("never");
+  });
+
+  it("rejects native execution denied by the retained global policy owner", async () => {
+    const workspaceDir = path.join(tempDir, "policy-workspace");
+    const sessionFile = path.join(tempDir, "policy-session.jsonl");
+    const params = createParams(sessionFile, workspaceDir);
+    params.agentId = "main";
+    params.agentDir = path.join(tempDir, "main-agent");
+    params.sandboxSessionKey = "global";
+    params.sandboxAgentId = "policy";
+    params.config = {
+      agents: {
+        entries: {
+          main: {},
+          policy: { tools: { exec: { mode: "deny" } } },
+        },
+      },
+    };
+    registerCodexTestSessionIdentity(sessionFile, params.sessionId, params.sessionKey);
+
+    await expect(
+      prepareCodexAttemptConnection({
+        params,
+        options: { bindingStore: testCodexAppServerBindingStore },
+      }),
+    ).rejects.toThrow("effective tools.exec.mode=deny");
   });
 
   it("prepares one Guardian policy when requirements clamp an explicitly full session", async () => {
